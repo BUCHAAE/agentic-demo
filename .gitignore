@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+agent-env/
+.venv/
+venv/
+env/
+agent-ui/.venv/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Ollama models/cache
+.ollama/
+
+# Logs
+*.log
