@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 # Config
 # -------------------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL = os.getenv("MODEL", "llama3.1:8b")
+MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 JUICE_BASE = os.getenv("JUICE_BASE", "http://localhost:3001")
 
 app = FastAPI()
@@ -161,6 +161,16 @@ def nmap_scan(target: str = "localhost", ports: str = "1-65535") -> dict:
         "stderr_preview": (proc.stderr or "")[:400],
     }
 
+def render_prompt(messages: list[dict]) -> str:
+    parts = []
+    for m in messages:
+        role = (m.get("role") or "user").upper()
+        content = m.get("content") or ""
+        parts.append(f"{role}:\n{content}\n")
+    parts.append("ASSISTANT:\n")
+    return "\n".join(parts)
+
+
 def summary_generator(observations: list[dict]) -> dict:
     rows = []
     bullets = []
@@ -255,6 +265,12 @@ TOOLS:
 5) nmap_scan(target: str, ports: str) - identify open TCP ports and basic services (observation only)
 
 If no tool is needed, answer normally in plain English.
+
+IMPORTANT:
+- When NOT calling a tool, you must respond in plain English prose.
+- Do NOT return JSON, code, or bulletless blobs.
+- Use short headings and bullets for readability.
+
 Keep outputs short and manager-friendly.
 """
 
@@ -275,11 +291,69 @@ If you are unsure, choose robots_txt_analyser first.
 """
 
 
+#def call_ollama(messages: list[dict]) -> str:
+#    payload = {"model": MODEL, "messages": messages, "stream": False}
+#    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=60)
+#    r.raise_for_status()
+#    return r.json()["message"]["content"]
+
+
+
 def call_ollama(messages: list[dict]) -> str:
-    payload = {"model": MODEL, "messages": messages, "stream": False}
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
+    """
+    Calls Ollama using /api/generate.
+    We render chat messages into a single prompt string.
+    """
+    host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    model = os.getenv("OLLAMA_MODEL", MODEL)  # reuse your MODEL default/env
+
+    url = f"{host}/api/generate"
+    prompt = render_prompt(messages)
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }
+
+    r = requests.post(url, json=payload, timeout=120)
+
+    if not r.ok:
+        raise RuntimeError(f"Ollama error {r.status_code}: {r.text}")
+
+    data = r.json()
+    return data.get("response", "")
+
+def prettify_if_json(text: str) -> str:
+    t = (text or "").strip()
+
+    # If the model returned a JSON object/array as text, reformat it nicely.
+    if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
+        try:
+            obj = json.loads(t)
+            # Turn into readable markdown
+            if isinstance(obj, dict) and "tools" in obj:
+                lines = ["### Tools in this demo", ""]
+                for tool in obj.get("tools", []):
+                    name = tool.get("name", "unknown")
+                    desc = tool.get("description", "")
+                    lines.append(f"- **{name}** — {desc}")
+                app = obj.get("application")
+                role = obj.get("role")
+                lines.append("")
+                if app:
+                    lines.append(f"**Target:** {app}")
+                if role:
+                    lines.append(f"**Agent role:** {role}")
+                return "\n".join(lines)
+
+            # generic pretty JSON
+            return "```json\n" + json.dumps(obj, indent=2) + "\n```"
+        except Exception:
+            return text
+
+    return text
+
 
 
 def parse_tool_call(text: str):
@@ -306,7 +380,6 @@ async def chat_completions(req: Request):
 
     convo = [{"role": "system", "content": SYSTEM_PROMPT}] + user_messages
     observations: list[dict] = []
-    observations: list[dict] = []
     final_text = None
 
     # bounded loop for demo safety
@@ -314,20 +387,11 @@ async def chat_completions(req: Request):
         llm_out = call_ollama(convo)
         tool_call = parse_tool_call(llm_out)
 
-        # If it didn't return pure JSON, force TOOL_CALL_ONLY
+        # If the model answered normally (no tool call), that's allowed.
         if not tool_call:
-            convo.append({"role": "assistant", "content": llm_out})
-            convo.append({"role": "user", "content": TOOL_CONTROLLER_PROMPT})
-            llm_out = call_ollama(convo)
-            tool_call = parse_tool_call(llm_out)
-
-        # If still not a tool call, stop (demo safety)
-        if not tool_call:
-            final_text = (
-                "Model did not produce a valid tool call. "
-                "Stopping (demo safety)."
-            )
+            final_text = llm_out
             break
+
 
         tool = tool_call["tool"]
         args = tool_call.get("args", {}) or {}
@@ -373,7 +437,8 @@ async def chat_completions(req: Request):
     if final_text is None:
         final_text = "Stopped after max steps (demo safety limit)."
 
-
+    final_text = prettify_if_json(final_text)
+    
     # OpenAI-compatible shape for Open WebUI
     resp = {
         "id": "chatcmpl-agentic-demo",
