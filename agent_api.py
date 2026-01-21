@@ -6,6 +6,7 @@ import subprocess
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+
 # -------------------------
 # Config
 # -------------------------
@@ -16,14 +17,16 @@ JUICE_BASE = os.getenv("JUICE_BASE", "http://localhost:3001")
 app = FastAPI()
 
 
-
+# -------------------------
+# Tool registry metadata
+# -------------------------
 def list_tools() -> dict:
     return {
         "tool": "list_tools",
         "tools": [
             {
                 "name": "http_get",
-                "description": "Fetch a specific HTTP path and observe status code, content type, and response preview (GET only).",
+                "description": "Fetch a specific HTTP PATH (GET) and observe status code, content type, and response preview.",
                 "safety": "Read-only, no payloads, no parameter mutation."
             },
             {
@@ -33,13 +36,13 @@ def list_tools() -> dict:
             },
             {
                 "name": "content_type_check",
-                "description": "Classify endpoints as API vs HTML based on HTTP headers and response body.",
-                "safety": "Observation only, no inference beyond evidence."
+                "description": "Classify endpoints as API vs HTML based on HTTP headers.",
+                "safety": "Observation only, no exploitation."
             },
             {
                 "name": "nmap_scan",
-                "description": "Identify open TCP ports and basic services on a target host.",
-                "safety": "Safe TCP connect scan only, no scripts, no exploitation."
+                "description": "Identify open TCP ports and basic services on the local host.",
+                "safety": "Safe TCP connect scan only, no scripts, no exploitation. Demo-restricted to localhost."
             },
             {
                 "name": "summary_generator",
@@ -50,13 +53,21 @@ def list_tools() -> dict:
     }
 
 
-
 # -------------------------
-# Tools (4)
+# Tools (read-only)
 # -------------------------
 def http_get(path: str) -> dict:
+    """
+    PATH ONLY. Reject full URLs.
+    """
+    path = (path or "").strip()
+
+    if path.startswith("http://") or path.startswith("https://"):
+        raise ValueError("http_get expects a PATH like '/robots.txt' not a full URL.")
+
     if not path.startswith("/"):
         path = "/" + path
+
     url = JUICE_BASE.rstrip("/") + path
     r = requests.get(url, timeout=10)
     return {
@@ -72,11 +83,13 @@ def robots_txt_analyser() -> dict:
     url = JUICE_BASE.rstrip("/") + "/robots.txt"
     r = requests.get(url, timeout=10)
     disallow = []
+
     if r.ok and r.text:
         for line in r.text.splitlines():
             line = line.strip()
             if line.lower().startswith("disallow:"):
                 disallow.append(line.split(":", 1)[1].strip() or "/")
+
     return {
         "tool": "robots_txt_analyser",
         "url": url,
@@ -85,8 +98,13 @@ def robots_txt_analyser() -> dict:
         "raw_preview": (r.text or "")[:500],
     }
 
+
 def content_type_check(path=None, paths=None):
-    # Normalise inputs so the tool is robust to model variance
+    """
+    Robust to model variance:
+      - content_type_check(path="/foo")
+      - content_type_check(paths=["/foo","/bar"])
+    """
     if paths is None and path is not None:
         paths = path
 
@@ -96,13 +114,15 @@ def content_type_check(path=None, paths=None):
     results = []
 
     for p in paths or []:
+        p = (p or "").strip()
+        if p.startswith("http://") or p.startswith("https://"):
+            raise ValueError("content_type_check expects PATH(s) like '/robots.txt' not full URLs.")
         if not p.startswith("/"):
             p = "/" + p
 
         url = JUICE_BASE.rstrip("/") + p
         r = requests.get(url, timeout=10, allow_redirects=True)
-
-        ct = r.headers.get("content-type", "").lower()
+        ct = (r.headers.get("content-type", "") or "").lower()
 
         results.append({
             "path": p,
@@ -119,16 +139,20 @@ def content_type_check(path=None, paths=None):
     }
 
 
-
-
-
 def nmap_scan(target: str = "localhost", ports: str = "1-65535") -> dict:
-    """
-    Safe, read-only Nmap scan (demo-friendly):
-    - TCP connect scan only (-sT)
-    - No scripts, no OS detection
-    - Intended for local lab / training environments
-    """
+    target = (target or "").strip()
+
+    # Hard allowlist for demo safety
+    if target not in ("localhost", "127.0.0.1"):
+        raise ValueError("nmap_scan target must be 'localhost' or '127.0.0.1' only in this demo.")
+
+    # Reject URLs, spaces, weird tokens
+    if "://" in target or " " in target or "/" in target:
+        raise ValueError("nmap_scan target must be a host like 'localhost' or '127.0.0.1' (not a URL).")
+
+    if not re.match(r"^[A-Za-z0-9\.\-]+$", target):
+        raise ValueError("nmap_scan target contains invalid characters.")
+
     cmd = ["nmap", "-sT", "-Pn", "-p", ports, target]
 
     try:
@@ -147,9 +171,7 @@ def nmap_scan(target: str = "localhost", ports: str = "1-65535") -> dict:
         if "/tcp" in line and "open" in line:
             parts = line.split()
             if len(parts) >= 3:
-                open_ports.append(
-                    {"port": parts[0], "state": parts[1], "service": parts[2]}
-                )
+                open_ports.append({"port": parts[0], "state": parts[1], "service": parts[2]})
 
     return {
         "tool": "nmap_scan",
@@ -161,37 +183,31 @@ def nmap_scan(target: str = "localhost", ports: str = "1-65535") -> dict:
         "stderr_preview": (proc.stderr or "")[:400],
     }
 
-def render_prompt(messages: list[dict]) -> str:
-    parts = []
-    for m in messages:
-        role = (m.get("role") or "user").upper()
-        content = m.get("content") or ""
-        parts.append(f"{role}:\n{content}\n")
-    parts.append("ASSISTANT:\n")
-    return "\n".join(parts)
 
-
+# -------------------------
+# Summariser (fallback)
+# -------------------------
 def summary_generator(observations: list[dict]) -> dict:
     rows = []
     bullets = []
 
     for obs in observations:
-        tool = obs["tool"]
-        res = obs["result"]
+        tool = obs.get("tool")
+        res = obs.get("result", {})
 
         if tool == "content_type_check":
             for r in res.get("results", []):
                 rows.append({
-                    "path": r["path"],
-                    "status": r["status_code"],
-                    "content_type": r["content_type"],
-                    "classification": "HTML page" if r["is_html"] else "API(JSON)" if r["is_api"] else "other",
-                    "evidence": r.get("body_preview", "")[:120]
+                    "path": r.get("path", ""),
+                    "status": r.get("status_code", ""),
+                    "content_type": r.get("content_type", ""),
+                    "classification": "HTML page" if r.get("is_html") else "API(JSON)" if r.get("is_api") else "other",
+                    "evidence": (r.get("body_preview", "") or "")[:120]
                 })
 
         if tool == "http_get":
             bullets.append(
-                f"{res['url']} returned {res['status_code']} with {res['content_type']}"
+                f"{res.get('url','')} returned {res.get('status_code','?')} with {res.get('content_type','')}"
             )
 
         if tool == "nmap_scan":
@@ -207,7 +223,6 @@ def summary_generator(observations: list[dict]) -> dict:
             if "/ftp" in res.get("disallow_paths", []):
                 bullets.append("robots.txt references /ftp (robots exclusion is not access control)")
 
-    # Build table text
     table_lines = [
         "path | status_code | content_type | classification | evidence_1st_120_chars",
         "--- | --- | --- | --- | ---"
@@ -220,16 +235,12 @@ def summary_generator(observations: list[dict]) -> dict:
     summary = (
         "### Evidence table\n\n"
         + "\n".join(table_lines)
-        + "\n\n### Manager summary\n\n"
+        + "\n\n### Summary (observations only)\n\n"
         + "\n".join(f"- {b}" for b in bullets)
         + "\n\nNote: these are observations/signals, not confirmed vulnerabilities."
     )
 
-    return {
-        "tool": "summary_generator",
-        "summary": summary
-    }
-
+    return {"tool": "summary_generator", "summary": summary}
 
 
 TOOLS = {
@@ -238,11 +249,20 @@ TOOLS = {
     "content_type_check": content_type_check,
     "nmap_scan": nmap_scan,
     "summary_generator": summary_generator,
-    "list_tools": list_tools,        # 👈 HERE
+    "list_tools": list_tools,
 }
 
-SYSTEM_PROMPT = """You are a supervised security reconnaissance assistant for OWASP Juice Shop.
+
+# -------------------------
+# Prompts
+# -------------------------
+SYSTEM_PROMPT = f"""You are a supervised security reconnaissance assistant for OWASP Juice Shop.
 Your job is to help a human understand the application surface area and where to focus next.
+
+TARGET (do not invent):
+- The application under test is OWASP Juice Shop at JUICE_BASE = {JUICE_BASE}
+- Tools operate ONLY against JUICE_BASE using PATHS (e.g. /robots.txt)
+- nmap_scan target MUST be localhost or 127.0.0.1 only
 
 CRITICAL RULES:
 - Never invent endpoints, counts, or results. Use tools to gather evidence.
@@ -254,111 +274,86 @@ STRICT RULES:
 - No exploitation. No payloads. No brute force. Observation only.
 - Use nmap_scan only for local surface discovery. No scripts, no OS detection.
 - Use only the tools listed below.
-- If you want to use a tool, output JSON ONLY in this exact format:
-  {"tool":"<name>","args":{...}}
+
+TOOL CALL FORMAT (JSON ONLY):
+  {{"tool":"<name>","args":{{...}}}}
 
 TOOLS:
-1) http_get(path: str) - fetch a path and observe status/content-type/preview
+1) http_get(path: str) - fetch a PATH and observe status/content-type/preview
 2) robots_txt_analyser() - read /robots.txt and list disallowed paths
 3) content_type_check(path: str) - classify whether a path looks like API/data vs page
-4) summary_generator(observations: list[str]) - produce a manager-friendly briefing
-5) nmap_scan(target: str, ports: str) - identify open TCP ports and basic services (observation only)
+4) nmap_scan(target: str, ports: str) - identify open TCP ports and basic services (observation only)
+5) summary_generator(observations: list[dict]) - produce a manager-friendly briefing
+6) list_tools() - list available tools
 
-If no tool is needed, answer normally in plain English.
-
-IMPORTANT:
-- When NOT calling a tool, you must respond in plain English prose.
-- Do NOT return JSON, code, or bulletless blobs.
+IMPORTANT OUTPUT STYLE (when NOT calling a tool):
 - Use short headings and bullets for readability.
+- Always include:
+  - What we know (evidence)
+  - What we suspect (interpretation, clearly labelled)
+  - What we don’t know yet
+  - Where a human should focus next (SAFE, non-exploitative)
+  - Confidence (High/Medium/Low on key claims)
 
-Keep outputs short and manager-friendly.
-"""
-
-TOOL_CONTROLLER_PROMPT = """TOOL_CALL_ONLY MODE.
-Return ONLY a single JSON object for the next tool call.
-No prose. No markdown. No code fences. No backticks.
-JSON format:
-{"tool":"<name>","args":{...}}
-
-Allowed tools:
-- http_get (args: {"path":"/..."})
-- robots_txt_analyser (args: {})
-- content_type_check (args: {"path":"/..."})
-- summary_generator (args: {"observations":[...]} )
-- nmap_scan (args: {"target":"localhost","ports":"1-65535"})
-
-If you are unsure, choose robots_txt_analyser first.
+Keep it manager-friendly but specific.
 """
 
 
-#def call_ollama(messages: list[dict]) -> str:
-#    payload = {"model": MODEL, "messages": messages, "stream": False}
-#    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=60)
-#    r.raise_for_status()
-#    return r.json()["message"]["content"]
-
+# -------------------------
+# Ollama helpers
+# -------------------------
+def render_prompt(messages: list[dict]) -> str:
+    parts = []
+    for m in messages:
+        role = (m.get("role") or "user").upper()
+        content = m.get("content") or ""
+        parts.append(f"{role}:\n{content}\n")
+    parts.append("ASSISTANT:\n")
+    return "\n".join(parts)
 
 
 def call_ollama(messages: list[dict]) -> str:
     """
-    Calls Ollama using /api/generate.
-    We render chat messages into a single prompt string.
+    Calls Ollama using /api/generate (single prompt string).
     """
     host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-    model = os.getenv("OLLAMA_MODEL", MODEL)  # reuse your MODEL default/env
-
+    model = os.getenv("OLLAMA_MODEL", MODEL)
     url = f"{host}/api/generate"
-    prompt = render_prompt(messages)
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-    }
+    prompt = render_prompt(messages)
+    payload = {"model": model, "prompt": prompt, "stream": False}
 
     r = requests.post(url, json=payload, timeout=120)
-
     if not r.ok:
         raise RuntimeError(f"Ollama error {r.status_code}: {r.text}")
 
     data = r.json()
     return data.get("response", "")
 
+
 def prettify_if_json(text: str) -> str:
     t = (text or "").strip()
-
-    # If the model returned a JSON object/array as text, reformat it nicely.
     if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
         try:
             obj = json.loads(t)
-            # Turn into readable markdown
             if isinstance(obj, dict) and "tools" in obj:
                 lines = ["### Tools in this demo", ""]
                 for tool in obj.get("tools", []):
                     name = tool.get("name", "unknown")
                     desc = tool.get("description", "")
                     lines.append(f"- **{name}** — {desc}")
-                app = obj.get("application")
-                role = obj.get("role")
-                lines.append("")
-                if app:
-                    lines.append(f"**Target:** {app}")
-                if role:
-                    lines.append(f"**Agent role:** {role}")
                 return "\n".join(lines)
-
-            # generic pretty JSON
             return "```json\n" + json.dumps(obj, indent=2) + "\n```"
         except Exception:
             return text
-
     return text
 
 
-
 def parse_tool_call(text: str):
-    # Tool calls must be JSON ONLY (no extra text)
-    text = text.strip()
+    """
+    Tool calls must be JSON ONLY (no extra text).
+    """
+    text = (text or "").strip()
     try:
         obj = json.loads(text)
         if isinstance(obj, dict) and "tool" in obj:
@@ -371,6 +366,93 @@ def parse_tool_call(text: str):
     return None
 
 
+# -------------------------
+# NEW: Safe recon playbook + strong synthesis
+# -------------------------
+SAFE_DEFAULT_PATHS = [
+    "/", "/robots.txt", "/sitemap.xml", "/favicon.ico", "/manifest.json"
+]
+
+
+def dedupe_keep_order(items):
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def run_safe_recon_playbook() -> list[dict]:
+    """
+    Fixed safe plan:
+      1) robots.txt
+      2) verify + classify candidate paths
+      3) nmap localhost (basic observation)
+    """
+    observations = []
+
+    robots_res = robots_txt_analyser()
+    observations.append({"tool": "robots_txt_analyser", "result": robots_res})
+
+    disallowed = (robots_res.get("disallow_paths") or [])[:20]
+    candidate_paths = dedupe_keep_order(SAFE_DEFAULT_PATHS + disallowed)
+
+    for p in candidate_paths:
+        hg = http_get(p)
+        observations.append({"tool": "http_get", "result": hg})
+
+        if hg.get("status_code") in (200, 301, 302, 401, 403):
+            ct = content_type_check(path=p)
+            observations.append({"tool": "content_type_check", "result": ct})
+
+    nm = nmap_scan(target="127.0.0.1", ports="1-10000")
+    observations.append({"tool": "nmap_scan", "result": nm})
+
+    return observations
+
+
+def build_security_handoff_prompt(observations: list[dict]) -> str:
+    return f"""
+You are a supervised security reconnaissance assistant. Observation-only. Do NOT propose exploitation or payloads.
+
+Write a concise security handoff with headings:
+
+## What we know (evidence)
+- bullets grounded in the observations (include key paths, status codes, content-types, and any open ports)
+
+## What we suspect (interpretation)
+- clearly label as interpretation, not fact
+- include “expected for OWASP Juice Shop” vs “would be concerning in production”
+
+## What we don’t know yet
+- unknowns that cannot be concluded from the evidence
+
+## Where a human should focus next (safe)
+- safe activities only: browser devtools/network review, JS bundle review, auth/session flow review
+- no exploit steps, no attack payloads
+
+## Confidence
+- list 3–6 key claims with High/Medium/Low confidence and why
+
+Observations JSON:
+{json.dumps(observations, indent=2)}
+""".strip()
+
+
+def generate_security_handoff(observations: list[dict]) -> str:
+    prompt = build_security_handoff_prompt(observations)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return call_ollama(messages)
+
+
+# -------------------------
+# API endpoint
+# -------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     body = await req.json()
@@ -378,35 +460,60 @@ async def chat_completions(req: Request):
     if not user_messages:
         return JSONResponse({"error": "No messages provided"}, status_code=400)
 
+    # Detect simple "run the recon" triggers so the demo feels agentic
+    last_user = ""
+    for m in reversed(user_messages):
+        if m.get("role") == "user":
+            last_user = (m.get("content") or "").strip().lower()
+            break
+
+    recon_triggers = {
+        "next",
+        "start",
+        "start recon",
+        "start reconnaissance",
+        "run recon",
+        "recon",
+        "begin recon",
+        "begin reconnaissance",
+        "do recon",
+        "do reconnaissance",
+    }
+
+    if last_user in recon_triggers:
+        observations = run_safe_recon_playbook()
+        final_text = generate_security_handoff(observations)
+        final_text = prettify_if_json(final_text)
+
+        resp = {
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": final_text}, "finish_reason": "stop"}
+            ],
+            "model": MODEL,
+        }
+        return JSONResponse(resp)
+
+    # Otherwise: normal tool-using chat loop (bounded for safety)
     convo = [{"role": "system", "content": SYSTEM_PROMPT}] + user_messages
     observations: list[dict] = []
     final_text = None
 
-    # bounded loop for demo safety
     for _ in range(12):
         llm_out = call_ollama(convo)
         tool_call = parse_tool_call(llm_out)
 
-        # If the model answered normally (no tool call), that's allowed.
+        # No tool call => final answer in prose
         if not tool_call:
             final_text = llm_out
             break
 
-
         tool = tool_call["tool"]
         args = tool_call.get("args", {}) or {}
 
-        # Prevent the model from ending the loop early with summary_generator
-        if tool == "summary_generator":
-            observations.append({"tool": "controller", "result": {"note": "Model requested summary generation"}})
-            # Do NOT execute it here; summary is controlled by the agent
-            continue
-
-
         if tool not in TOOLS:
-            final_text = (
-                f"I can't use tool '{tool}'. Allowed: {', '.join(TOOLS.keys())}."
-            )
+            final_text = f"I can't use tool '{tool}'. Allowed: {', '.join(TOOLS.keys())}."
             break
 
         # Execute tool safely
@@ -418,28 +525,19 @@ async def chat_completions(req: Request):
 
         observations.append({"tool": tool, "result": result})
 
-
         # Add tool request + result back into conversation
         convo.append({"role": "assistant", "content": llm_out})
-        convo.append(
-            {
-                "role": "user",
-                "content": f"Tool result:\n{json.dumps(result, indent=2)}",
-            }
-        )
+        convo.append({"role": "user", "content": f"Tool result:\n{json.dumps(result, indent=2)}"})
 
-
-
+    # If the model never produced a prose answer, generate a proper handoff
     if final_text is None and observations:
-        result = summary_generator(observations)
-        final_text = result["summary"]
+        final_text = generate_security_handoff(observations)
 
     if final_text is None:
         final_text = "Stopped after max steps (demo safety limit)."
 
     final_text = prettify_if_json(final_text)
-    
-    # OpenAI-compatible shape for Open WebUI
+
     resp = {
         "id": "chatcmpl-agentic-demo",
         "object": "chat.completion",
