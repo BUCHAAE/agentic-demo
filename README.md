@@ -48,3 +48,10 @@ Summarise what we know, what we don’t know yet, and where a human security eng
 
 ### Optional bonus prompt (if time allows)
 What evidence supports your conclusions, and what assumptions did you avoid making?
+
+
+
+export OLLAMA_MODEL="llama3.1:8b"
+
+
+echo $OLLAMA_MODEL
