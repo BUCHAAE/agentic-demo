@@ -4,6 +4,7 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse  # ✅ required by summary_generator/_parse_base
 
 import requests
 from fastapi import FastAPI, Request
@@ -34,19 +35,114 @@ OLLAMA_LOCK = threading.Lock()
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "16"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "1200"))
 
-
 app = FastAPI()
 
-print(f"[CONFIG] OLLAMA_URL={OLLAMA_URL}  OLLAMA_MODEL={MODEL}  JUICE_BASE={JUICE_BASE}  JUICE_TARGET={JUICE_TARGET}:{JUICE_TARGET_PORT}")
+print(
+    f"[CONFIG] OLLAMA_URL={OLLAMA_URL}  OLLAMA_MODEL={MODEL}  JUICE_BASE={JUICE_BASE}  JUICE_TARGET={JUICE_TARGET}:{JUICE_TARGET_PORT}"
+)
+
+# -------------------------
+# Deterministic persona replies (demo polish)
+# -------------------------
+SNOOPY_NAME_RESPONSE = "My name is Snoopy."
+
+# -------------------------
+# ASCII helper (PUT IT HERE)
+# -------------------------
+def as_markdown_codeblock(text: str) -> str:
+    lines = (text or "").splitlines()
+    return "\n".join(
+        ("    " + line) if line.strip() else "    "
+        for line in lines
+    )
+
+# IMPORTANT: no markdown fences; return raw text only
+SNOOPY_ASCII_ART = (
+    "             .----.\n"
+    "          _.'__    `.\n"
+    "      .--(#)(##)---/#\\\n"
+    "    .' @          /###\\\n"
+    "    :         ,   #####\n"
+    "     `-..__.-' _.-\\###/\n"
+    "           `;_:    `\"'\n"
+    "         .'\"\"\"\"\"`.\n"
+    "        /,       ,\\\n"
+    "       //  COOL!  \\\\\n"
+    "       `-._______.-'\n"
+    "       ___`. | .'___\n"
+    "      (______|______)\n"
+)
+
+
+def _norm_user_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def is_name_question(text: str) -> bool:
+    t = _norm_user_text(text)
+    # Keep it simple + robust to punctuation/phrasing
+    return (
+        t in {"what is your name", "whats your name", "what's your name"}
+        or t.startswith("what is your name")
+        or t.startswith("what's your name")
+        or t.startswith("whats your name")
+    )
+
+def is_picture_request(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower()
+
+    triggers = [
+        "picture of yourself",
+        "picture of you",
+        "photo of yourself",
+        "photo of you",
+        "show me a picture",
+        "show me a photo",
+        "what do you look like",
+        "draw yourself",
+        "draw you",
+    ]
+
+    return any(trigger in t for trigger in triggers)
+
+def is_general_question(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    # Obvious non-recon topics
+    non_recon_keywords = [
+        "population",
+        "moon",
+        "sun",
+        "capital",
+        "where is",
+        "who is",
+        "when was",
+        "how many people",
+        "weather",
+        "history",
+        "define",
+        "meaning of",
+        "explain",
+    ]
+
+    return any(k in t for k in non_recon_keywords)
 
 # -------------------------
 # Safe path policy (prevents LLM guessing garbage routes)
 # -------------------------
 SAFE_SEED_PATHS: Set[str] = {
-    "/", "/robots.txt",
-    "/ftp", "/admin",
-    "/api", "/rest", "/assets", "/socket.io",
-    "/health", "/healthcheck"
+    "/",
+    "/robots.txt",
+    "/ftp",
+    "/admin",
+    "/api",
+    "/rest",
+    "/assets",
+    "/socket.io",
+    "/health",
+    "/healthcheck",
 }
 
 def normalise_path(p: str) -> str:
@@ -133,7 +229,6 @@ def http_get(path: str = "/") -> dict:
         "body_preview": (r.text or "")[:500],
     }
 
-
 def robots_txt_analyser() -> dict:
     url = JUICE_BASE.rstrip("/") + "/robots.txt"
     r = requests.get(url, timeout=10, allow_redirects=False)
@@ -150,7 +245,6 @@ def robots_txt_analyser() -> dict:
         "disallow_paths": disallow[:30],
         "raw_preview": (r.text or "")[:500],
     }
-
 
 def content_type_check(path=None, paths=None) -> dict:
     # Supports either "path" or "paths"
@@ -181,7 +275,6 @@ def content_type_check(path=None, paths=None) -> dict:
         )
 
     return {"tool": "content_type_check", "results": results}
-
 
 def nmap_scan(target: str = None, ports: str = None) -> dict:
     """
@@ -234,7 +327,6 @@ def _is_docker_bridge_ip(host: str) -> bool:
     # Common Docker default bridge ranges
     return host.startswith(("172.17.", "172.18.", "172.19."))
 
-
 def _parse_base(base_url: str) -> Dict[str, str]:
     """
     Returns {"scheme": "...", "host": "...", "port": "...", "netloc": "...", "base": "..."}
@@ -249,7 +341,6 @@ def _parse_base(base_url: str) -> Dict[str, str]:
     except Exception:
         return {"scheme": "http", "host": "", "port": "", "netloc": base_url, "base": base_url}
 
-
 def _uniq_preserve(seq):
     seen = set()
     out = []
@@ -259,12 +350,10 @@ def _uniq_preserve(seq):
             out.append(x)
     return out
 
-
 def summary_generator(observations: List[Dict[str, Any]]) -> dict:
     base_info = _parse_base(JUICE_BASE)
     target_url = base_info["base"]
     host = base_info["host"]
-    port = base_info["port"]
 
     deployment_line = "Local service"
     if host and _is_docker_bridge_ip(host):
@@ -272,7 +361,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
     elif host in ("127.0.0.1", "localhost"):
         deployment_line = "Local host (loopback)"
 
-    # ---- Collect evidence (minimal, non-repetitive) ----
     verified_paths = []  # tuples: (path, status, content_type, classification)
     robots_disallow = []
     open_ports = []  # strings like "3000/tcp"
@@ -296,7 +384,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
             robots_disallow = res.get("disallow_paths", []) or []
 
         elif tool == "http_get":
-            # We can extract the path from the URL to avoid trusting the model
             url = (res.get("url") or "").strip()
             status = res.get("status_code")
             ct = res.get("content_type", "")
@@ -318,22 +405,17 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
         elif tool == "nmap_scan":
             performed_port_check = True
             for p in (res.get("open_ports") or []):
-                # Keep exact evidence string
                 portstr = p.get("port", "")
                 if portstr:
                     open_ports.append(portstr)
 
-    # Deduplicate paths and ports while preserving order
     verified_paths = _uniq_preserve(verified_paths)
     open_ports = _uniq_preserve(open_ports)
 
-    # Useful booleans derived from evidence
     has_ftp_signal = any(str(x).lower().strip("/") == "ftp" or "/ftp" in str(x).lower() for x in robots_disallow)
     saw_ftp = any(p == "/ftp" and int(s or 0) == 200 for (p, s, _, _) in verified_paths if s is not None)
     saw_admin = any(p == "/admin" and int(s or 0) == 200 for (p, s, _, _) in verified_paths if s is not None)
 
-    # ---- Build narrative sections ----
-    # Target environment
     target_env_lines = [
         f"- **Application:** OWASP Juice Shop",
         f"- **Location:** `{target_url}`",
@@ -341,14 +423,12 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
     ]
     if performed_port_check:
         if open_ports:
-            # Example: "3000/tcp appears open" is too tool-like; keep clean:
             target_env_lines.append(f"- **Observed exposed service(s):** {', '.join(open_ports)}")
         else:
             target_env_lines.append("- **Observed exposed service(s):** (none reported by port check)")
     else:
         target_env_lines.append("- **Port exposure:** Not assessed in this run (no port-check step executed)")
 
-    # What we did
     did_lines = [
         "### What We Did",
         "- **Phase 1 — Passive discovery:** Retrieved `robots.txt` to identify signposted areas without probing.",
@@ -359,7 +439,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
     else:
         did_lines.append("- **Phase 3 — Environment confirmation:** Skipped (no port check executed).")
 
-    # What we know
     know_lines = [
         "### What We Know (Evidence-Based)",
         f"- The application responds normally at `{target_url}`.",
@@ -384,10 +463,8 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
         know_lines.append("- The `/admin` path exists and returned **HTTP 200** (HTML page).")
 
     if performed_port_check and open_ports:
-        # In your constrained demo this should be 3000/tcp only
         know_lines.append(f"- Observed exposed service(s) aligned to the application: **{', '.join(open_ports)}**.")
 
-    # What we don't know
     dont_know_lines = [
         "### What We Do Not Know Yet",
         "- Whether `/ftp` exposes sensitive files, upload/download behaviour, or any access control boundary.",
@@ -396,7 +473,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
         "- Whether any vulnerabilities are present (no exploitation or attack payloads were used).",
     ]
 
-    # Why this matters
     why_lines = [
         "### Why This Matters",
         "The `/ftp` entry in `robots.txt` is a **deliberate disclosure** by the application, not a vulnerability.",
@@ -404,7 +480,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
         "At this stage we keep conclusions deliberately narrow: we have **surface evidence**, not confirmed security findings.",
     ]
 
-    # Next steps
     next_steps_lines = [
         "### Recommended Next Steps (Human-Led)",
         "1. **Manually inspect `/ftp`:** look for listings, file download/upload behaviour, and any access control cues.",
@@ -419,7 +494,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
         "- No brute force, payload injection, or exploitation was performed.",
     ]
 
-    # Optional: include a compact evidence table (but readable, not loggy)
     evidence_rows = []
     for p, s, ct, cl in verified_paths:
         evidence_rows.append(f"| `{p}` | {s} | {ct} | {cl} |")
@@ -452,7 +526,6 @@ def summary_generator(observations: List[Dict[str, Any]]) -> dict:
 
     return {"tool": "summary_generator", "summary": summary}
 
-
 def capabilities_and_rules() -> dict:
     tools = list_tools()["tools"]
 
@@ -461,7 +534,6 @@ def capabilities_and_rules() -> dict:
         "robots_txt_analyser": {},
         "content_type_check": {"paths": ["/", "/robots.txt", "/ftp", "/admin"]},
         "nmap_scan": {"target": "JUICE_TARGET", "ports": "3000"},
-        # model is blocked from calling summary_generator (controller-only)
         "summary_generator": {"observations": "[controller-only]"},
         "capabilities_and_rules": {},
     }
@@ -492,7 +564,7 @@ def capabilities_and_rules() -> dict:
         "HTTP tools are GET-only and do not follow redirects",
         "nmap_scan is hard-coded to safe flags (-sT -Pn) and has a timeout",
         "nmap_scan target is enforced to JUICE_TARGET (container scope only)",
-        "Agent loop stops if model fails to produce valid tool-call JSON (demo safety)",
+        "Agent loop stops if the model fails to produce valid tool-call JSON (demo safety)",
         "Summary generation is controller-only (the model cannot trigger summary_generator)",
         "Non-discovered/unknown paths are blocked (prevents LLM guessing / credibility loss)",
     ]
@@ -505,7 +577,6 @@ def capabilities_and_rules() -> dict:
         "guardrails_enforced_by_code": guardrails,
     }
 
-
 TOOLS = {
     "http_get": http_get,
     "robots_txt_analyser": robots_txt_analyser,
@@ -517,18 +588,11 @@ TOOLS = {
 }
 
 SYSTEM_PROMPT = """
+You are Snoopy, a famous internet reconnaissance specialist, part of a red team.
+Your job is to help a human understand the application surface area and where to focus next.
 
-You are Snoopy, a famous internet reconnaissance speciallist, you are part of a red team. Your job is to help a human understand the application surface area and where to focus next.
-
-You are a confident, imaginative reconnaissance agent.
 You speak clearly and calmly.
 You follow guardrails strictly and never exceed your permissions.
-
-If asked your name, you respond:
-"My name is Snoopy."
-
-You may include light humour, but you take safety seriously.
-
 
 CRITICAL RULES:
 - Never invent endpoints, counts, or results. Use tools to gather evidence.
@@ -553,30 +617,8 @@ TOOLS:
 
 If no tool is needed, answer normally in plain English.
 Keep outputs short and manager-friendly.
-
-WHEN SUMMARISING RESULTS:
-
-You must write as a senior security engineer summarising findings for a technical but non-expert audience.
-
-Your summary MUST:
-- Clearly state the target system and environment
-- Distinguish facts from assumptions
-- Explicitly state what is known vs unknown
-- Avoid speculation or vulnerability claims
-- Reference only evidence observed via tools
-- Explain *why* each observation matters
-- Avoid repetition
-- Avoid listing raw tool output
-- Be concise, structured, and professional
-
-Your tone should be:
-- Calm
-- Confident
-- Evidence-based
-- Non-alarmist
 """
 
-# IMPORTANT: this prompt must match the real safety rules (no localhost / 1-65535)
 TOOL_CONTROLLER_PROMPT = """TOOL_CALL_ONLY MODE.
 Return ONLY a single JSON object for the next tool call.
 No prose. No markdown. No code fences. No backticks.
@@ -593,7 +635,6 @@ Allowed tools:
 If you are unsure, choose robots_txt_analyser first.
 """
 
-
 def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str:
     """
     Hardened Ollama call:
@@ -602,7 +643,6 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
     - Caps generation length (prevents long stalls)
     - Uses connect/read timeout tuple
     """
-    # Trim history (keep system + last N messages)
     if not messages:
         return ""
 
@@ -619,7 +659,7 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
         "stream": False,
         "options": {
             "temperature": 0 if force_json else 0.2,
-            "num_predict": OLLAMA_MAX_PREDICT,  # caps latency
+            "num_predict": OLLAMA_MAX_PREDICT,
         },
     }
 
@@ -628,7 +668,6 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
 
     timeout = (OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT)
 
-    # Serialize calls so Streamlit can't trigger concurrent stalls
     with OLLAMA_LOCK:
         try:
             r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload_gen, timeout=timeout)
@@ -638,7 +677,6 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
             debug_gen = (r.text or "")[:200]
             print(f"[OLLAMA] /api/generate failed status={r.status_code} body={debug_gen}")
 
-            # Fallback to /api/chat
             payload_chat: Dict[str, Any] = {"model": MODEL, "messages": trimmed, "stream": False}
             if force_json:
                 payload_chat["format"] = "json"
@@ -654,7 +692,6 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
             return r2.json().get("message", {}).get("content", "") or ""
 
         except requests.exceptions.ReadTimeout:
-            # Return a controlled response (prevents 500s)
             return (
                 "I hit an Ollama timeout while generating the next step. "
                 "This is usually caused by a long prompt or concurrent requests. "
@@ -662,13 +699,6 @@ def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str
             )
 
 def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Robust tool-call parser:
-    - Strips code fences
-    - Tries full JSON parse
-    - If that fails, extracts first {...} block and parses that
-    - Validates schema: {"tool": str, "args": dict}
-    """
     if not text:
         return None
 
@@ -696,9 +726,7 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 
     try:
         obj = json.loads(t)
-        v = _validate(obj)
-        if v:
-            return v
+        return _validate(obj)
     except Exception:
         pass
 
@@ -728,25 +756,55 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def is_tools_question(text: str) -> bool:
-    t = (text or "").lower()
+    t = (text or "").lower().strip()
+
+    # quick keyword gating (robust)
+    tools_keywords = ["tool", "tools", "capabilit", "guardrail", "allowed", "not allowed", "can't", "cannot", "rules"]
+    if not any(k in t for k in tools_keywords):
+        return False
+
+    # specific phrases
     triggers = [
         "what tools do you have",
         "what tools are available",
+        "what tools can you use",
+        "tell me what tools you can use",
+        "tell me what tools you have",
         "list tools",
+        "show tools",
         "capabilities",
-        "rules",
-        "not allowed",
-        "explicitly not allowed",
-        "restrictions",
         "guardrails",
+        "restrictions",
         "what are you allowed",
         "what are you not allowed",
         "what can't you do",
+        "what cannot you do",
+        "explicitly not allowed",
     ]
     return any(x in t for x in triggers)
 
+def looks_like_tool_intent(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    tl = t.lower()
+
+    if t.startswith("{") and ("tool" in tl or "args" in tl):
+        return True
+    if '"tool"' in tl or "'tool'" in tl or '"args"' in tl or "'args'" in tl:
+        return True
+
+    if any(name in tl for name in [
+        "http_get",
+        "robots_txt_analyser",
+        "content_type_check",
+        "nmap_scan",
+        "capabilities_and_rules",
+    ]):
+        return True
+
+    return False
 
 def deterministic_capabilities_markdown() -> str:
     cap = capabilities_and_rules()
@@ -769,43 +827,105 @@ def deterministic_capabilities_markdown() -> str:
 
     return "\n".join(md)
 
-
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     body = await req.json()
     user_messages = body.get("messages", [])
-    if not user_messages:
-        return JSONResponse({"error": "No messages provided"}, status_code=400)
 
-    # --- Deterministic shortcut for demo-quality answers about tools/rules ---
     last_user = ""
     for m in reversed(user_messages):
         if m.get("role") == "user":
             last_user = m.get("content", "")
+            print("DEBUG last_user repr a:", repr(last_user))
             break
 
-    if is_tools_question(last_user):
-        final_text = deterministic_capabilities_markdown()
+    # ✅ ASCII image response
+    if is_picture_request(last_user):
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": SNOOPY_ASCII_ART},
+                "finish_reason": "stop",
+            }],
+            "model": MODEL,
+        })
+    if is_name_question(last_user):
         resp = {
             "id": "chatcmpl-agentic-demo",
             "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text}, "finish_reason": "stop"}],
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": SNOOPY_NAME_RESPONSE
+                },
+                "finish_reason": "stop"
+            }],
             "model": MODEL,
         }
         return JSONResponse(resp)
+
+    # --- Deterministic shortcut for demo-quality answers about tools/rules ---
+    # ✅ ABSOLUTE PRIORITY: tools / rules questions
+    if is_tools_question(last_user):
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": deterministic_capabilities_markdown(),
+                },
+                "finish_reason": "stop",
+            }],
+            "model": MODEL,
+        })
     # --- end shortcut ---
 
+    # ✅ GENERAL CHAT / NON-RECON QUESTIONS
+    if is_general_question(last_user):
+        convo = [
+            {
+                "role": "system",
+                "content": "Answer the user's question directly and clearly. Do not use tools."
+            }
+        ] + user_messages
+
+        answer = call_ollama(convo)
+
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": answer
+                },
+                "finish_reason": "stop",
+            }],
+            "model": MODEL,
+        })
+
+    # ---- ONLY NOW do we enter the agent loop ----
     convo = [{"role": "system", "content": SYSTEM_PROMPT}] + user_messages
     observations: List[Dict[str, Any]] = []
     final_text: Optional[str] = None
 
-    # Tracks what we *actually* discovered (so we can prevent LLM guessing)
     discovered_paths: Set[str] = set()
 
     MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
     for step in range(MAX_STEPS):
         llm_out = call_ollama(convo)
         tool_call = parse_tool_call(llm_out)
+
+        # ✅ If it isn't a tool call and doesn't look like tool intent, accept it as final answer
+        if not tool_call and llm_out.strip() and not looks_like_tool_intent(llm_out):
+            final_text = llm_out.strip()
+            break
 
         if not tool_call:
             convo.append({"role": "assistant", "content": llm_out})
@@ -837,16 +957,14 @@ async def chat_completions(req: Request):
                 final_text = f"I can't use tool '{tool}'. Allowed: {', '.join(TOOLS.keys())}."
                 break
 
-        # ---- WOW guardrail: stop path guessing ----
+        # ---- Guardrail: stop path guessing ----
         if tool in ("http_get", "content_type_check"):
-            # normalise to either args["path"] or args["paths"]
             if "paths" in args and isinstance(args["paths"], list):
                 safe_paths = []
                 for p in args["paths"]:
                     p = normalise_path(str(p))
                     if is_safe_path(p, discovered_paths):
                         safe_paths.append(p)
-                # If nothing survived, fall back to "/"
                 args["paths"] = safe_paths or ["/"]
                 args.pop("path", None)
             else:
@@ -877,10 +995,8 @@ async def chat_completions(req: Request):
         convo.append({"role": "user", "content": f"Tool result (truncated):\n{tool_text}"})
 
     if final_text is None and observations:
-        final_text = summary_generator(observations)["summary"]
-
-    if final_text is None:
-        final_text = "Stopped after max steps (demo safety limit)."
+        if not is_tools_question(last_user):
+            final_text = summary_generator(observations)["summary"]
 
     resp = {
         "id": "chatcmpl-agentic-demo",
@@ -889,7 +1005,6 @@ async def chat_completions(req: Request):
         "model": MODEL,
     }
     return JSONResponse(resp)
-
 
 @app.get("/health")
 def health():
