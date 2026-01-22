@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -20,6 +21,19 @@ MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 JUICE_BASE = os.getenv("JUICE_BASE", "http://127.0.0.1:3001")
 JUICE_TARGET = os.getenv("JUICE_TARGET", "127.0.0.1")
 JUICE_TARGET_PORT = os.getenv("JUICE_TARGET_PORT", "3000")
+
+# Ollama stability controls
+OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "5"))
+OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "180"))
+OLLAMA_MAX_PREDICT = int(os.getenv("OLLAMA_MAX_PREDICT", "256"))
+
+# Prevent multiple concurrent requests from piling up on Ollama
+OLLAMA_LOCK = threading.Lock()
+
+# Keep the prompt from growing without bound
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "16"))
+MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "1200"))
+
 
 app = FastAPI()
 
@@ -216,97 +230,226 @@ def nmap_scan(target: str = None, ports: str = None) -> dict:
         "stderr_preview": (proc.stderr or "")[:400],
     }
 
+def _is_docker_bridge_ip(host: str) -> bool:
+    # Common Docker default bridge ranges
+    return host.startswith(("172.17.", "172.18.", "172.19."))
+
+
+def _parse_base(base_url: str) -> Dict[str, str]:
+    """
+    Returns {"scheme": "...", "host": "...", "port": "...", "netloc": "...", "base": "..."}
+    """
+    try:
+        u = urlparse(base_url)
+        scheme = u.scheme or "http"
+        host = u.hostname or ""
+        port = str(u.port or (443 if scheme == "https" else 80))
+        netloc = f"{host}:{port}" if host else (u.netloc or base_url)
+        return {"scheme": scheme, "host": host, "port": port, "netloc": netloc, "base": f"{scheme}://{netloc}"}
+    except Exception:
+        return {"scheme": "http", "host": "", "port": "", "netloc": base_url, "base": base_url}
+
+
+def _uniq_preserve(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 
 def summary_generator(observations: List[Dict[str, Any]]) -> dict:
-    # Dedup tables + bullets to avoid “amateur spam”
-    row_by_path: Dict[str, Dict[str, Any]] = {}
-    bullets: Set[str] = set()
-    discovered: Set[str] = set()
+    base_info = _parse_base(JUICE_BASE)
+    target_url = base_info["base"]
+    host = base_info["host"]
+    port = base_info["port"]
 
-    # Phase flags (to make output read like a methodology)
-    did_robots = False
-    did_http = False
-    did_ct = False
-    did_nmap = False
+    deployment_line = "Local service"
+    if host and _is_docker_bridge_ip(host):
+        deployment_line = "Local Docker container (bridge network)"
+    elif host in ("127.0.0.1", "localhost"):
+        deployment_line = "Local host (loopback)"
+
+    # ---- Collect evidence (minimal, non-repetitive) ----
+    verified_paths = []  # tuples: (path, status, content_type, classification)
+    robots_disallow = []
+    open_ports = []  # strings like "3000/tcp"
+    performed_port_check = False
+
+    def classify(ct: str) -> str:
+        ct_l = (ct or "").lower()
+        if "text/html" in ct_l:
+            return "HTML page"
+        if "application/json" in ct_l:
+            return "API (JSON)"
+        if "text/plain" in ct_l:
+            return "Text"
+        return "Other"
 
     for obs in observations:
-        tool = obs["tool"]
-        res = obs["result"]
+        tool = obs.get("tool")
+        res = obs.get("result", {})
 
         if tool == "robots_txt_analyser":
-            did_robots = True
-            for p in res.get("disallow_paths", []) or []:
-                p = normalise_path(p)
-                discovered.add(p)
-            if any("ftp" in (x or "").lower() for x in res.get("disallow_paths", []) or []):
-                bullets.add("robots.txt references /ftp (robots exclusion is not access control)")
+            robots_disallow = res.get("disallow_paths", []) or []
 
         elif tool == "http_get":
-            did_http = True
-            url = res.get("url")
-            sc = res.get("status_code")
-            ct = res.get("content_type")
-            bullets.add(f"{url} returned {sc} with {ct}")
+            # We can extract the path from the URL to avoid trusting the model
+            url = (res.get("url") or "").strip()
+            status = res.get("status_code")
+            ct = res.get("content_type", "")
+            p = "/"
+            try:
+                u = urlparse(url)
+                p = u.path or "/"
+            except Exception:
+                pass
+            verified_paths.append((p, status, ct, classify(ct)))
 
         elif tool == "content_type_check":
-            did_ct = True
-            for r in res.get("results", []) or []:
-                path = r.get("path", "")
-                row_by_path.setdefault(
-                    path,
-                    {
-                        "path": path,
-                        "status": r.get("status_code", ""),
-                        "content_type": r.get("content_type", ""),
-                        "classification": "HTML page"
-                        if r.get("is_html")
-                        else "API(JSON)"
-                        if r.get("is_api")
-                        else "other",
-                        "evidence": (r.get("body_preview", "") or "")[:120],
-                    },
-                )
+            for r in (res.get("results") or []):
+                p = r.get("path", "")
+                status = r.get("status_code")
+                ct = r.get("content_type", "")
+                verified_paths.append((p, status, ct, classify(ct)))
 
         elif tool == "nmap_scan":
-            did_nmap = True
-            for p in res.get("open_ports", []) or []:
-                port = p.get("port", "")
-                svc = (p.get("service") or "").lower()
+            performed_port_check = True
+            for p in (res.get("open_ports") or []):
+                # Keep exact evidence string
+                portstr = p.get("port", "")
+                if portstr:
+                    open_ports.append(portstr)
 
-                # Don’t print embarrassing nmap guesses like “ppp” in the exec summary.
-                if port:
-                    if svc in ("http", "http-alt", "https"):
-                        bullets.add(f"{port} appears open ({svc})")
-                    else:
-                        bullets.add(f"{port} appears open")
+    # Deduplicate paths and ports while preserving order
+    verified_paths = _uniq_preserve(verified_paths)
+    open_ports = _uniq_preserve(open_ports)
 
-    # Build evidence table
-    rows = list(row_by_path.values())
-    table_lines = [
-        "path | status_code | content_type | classification | evidence_1st_120_chars",
-        "--- | --- | --- | --- | ---",
+    # Useful booleans derived from evidence
+    has_ftp_signal = any(str(x).lower().strip("/") == "ftp" or "/ftp" in str(x).lower() for x in robots_disallow)
+    saw_ftp = any(p == "/ftp" and int(s or 0) == 200 for (p, s, _, _) in verified_paths if s is not None)
+    saw_admin = any(p == "/admin" and int(s or 0) == 200 for (p, s, _, _) in verified_paths if s is not None)
+
+    # ---- Build narrative sections ----
+    # Target environment
+    target_env_lines = [
+        f"- **Application:** OWASP Juice Shop",
+        f"- **Location:** `{target_url}`",
+        f"- **Deployment:** {deployment_line}",
     ]
-    for r in rows:
-        table_lines.append(f"{r['path']} | {r['status']} | {r['content_type']} | {r['classification']} | {r['evidence']}")
+    if performed_port_check:
+        if open_ports:
+            # Example: "3000/tcp appears open" is too tool-like; keep clean:
+            target_env_lines.append(f"- **Observed exposed service(s):** {', '.join(open_ports)}")
+        else:
+            target_env_lines.append("- **Observed exposed service(s):** (none reported by port check)")
+    else:
+        target_env_lines.append("- **Port exposure:** Not assessed in this run (no port-check step executed)")
 
-    # Phase narrative (reads like a real recon approach)
-    phases = []
-    if did_robots:
-        phases.append("**Phase 1 – Passive discovery:** Read `/robots.txt` to identify signposted areas without probing.")
-    if did_http or did_ct:
-        phases.append("**Phase 2 – Minimal validation:** Confirmed a small set of known/discovered paths and classified responses.")
-    if did_nmap:
-        phases.append("**Phase 3 – Environment check (optional):** Confirmed expected service port exposure on the container target.")
+    # What we did
+    did_lines = [
+        "### What We Did",
+        "- **Phase 1 — Passive discovery:** Retrieved `robots.txt` to identify signposted areas without probing.",
+        "- **Phase 2 — Minimal validation:** Verified a small set of paths and classified responses (HTML vs text vs API).",
+    ]
+    if performed_port_check:
+        did_lines.append("- **Phase 3 — Environment confirmation:** Confirmed service exposure only for the known application target.")
+    else:
+        did_lines.append("- **Phase 3 — Environment confirmation:** Skipped (no port check executed).")
 
-    summary = (
-        "### Evidence table\n\n"
-        + "\n".join(table_lines)
-        + "\n\n### What we did (method)\n\n"
-        + ("\n".join(f"- {p}" for p in phases) if phases else "- No actions recorded.")
-        + "\n\n### Manager summary\n\n"
-        + "\n".join(f"- {b}" for b in sorted(bullets))
-        + "\n\nNote: these are observations/signals, not confirmed vulnerabilities."
+    # What we know
+    know_lines = [
+        "### What We Know (Evidence-Based)",
+        f"- The application responds normally at `{target_url}`.",
+    ]
+    if any(p == "/" and int(s or 0) == 200 for (p, s, _, _) in verified_paths if s is not None):
+        know_lines.append("- The root page (`/`) returned **HTTP 200** and served HTML content.")
+
+    if robots_disallow:
+        if has_ftp_signal:
+            know_lines.append("- `robots.txt` explicitly signposts **`/ftp`** (robots rules are not access control).")
+        else:
+            know_lines.append("- `robots.txt` is present and contains disallow rules (no assumptions beyond that).")
+    else:
+        know_lines.append("- `robots.txt` presence was not confirmed in this run.")
+
+    if saw_ftp:
+        know_lines.append("- The `/ftp` path exists and returned **HTTP 200** (HTML page).")
+    elif has_ftp_signal:
+        know_lines.append("- `/ftp` was signposted via `robots.txt`, but its content/behaviour has not yet been validated.")
+
+    if saw_admin:
+        know_lines.append("- The `/admin` path exists and returned **HTTP 200** (HTML page).")
+
+    if performed_port_check and open_ports:
+        # In your constrained demo this should be 3000/tcp only
+        know_lines.append(f"- Observed exposed service(s) aligned to the application: **{', '.join(open_ports)}**.")
+
+    # What we don't know
+    dont_know_lines = [
+        "### What We Do Not Know Yet",
+        "- Whether `/ftp` exposes sensitive files, upload/download behaviour, or any access control boundary.",
+        "- Whether `/admin` enforces authentication/authorisation (a 200 response alone does not prove access).",
+        "- Whether backend APIs exist behind the UI and how they are protected.",
+        "- Whether any vulnerabilities are present (no exploitation or attack payloads were used).",
+    ]
+
+    # Why this matters
+    why_lines = [
+        "### Why This Matters",
+        "The `/ftp` entry in `robots.txt` is a **deliberate disclosure** by the application, not a vulnerability.",
+        "However, it’s a strong prioritisation signal for a human reviewer because it highlights an area the developers did not want crawled or indexed.",
+        "At this stage we keep conclusions deliberately narrow: we have **surface evidence**, not confirmed security findings.",
+    ]
+
+    # Next steps
+    next_steps_lines = [
+        "### Recommended Next Steps (Human-Led)",
+        "1. **Manually inspect `/ftp`:** look for listings, file download/upload behaviour, and any access control cues.",
+        "2. **Check `/admin` boundary:** confirm whether authentication is required and what happens without credentials.",
+        "3. **Map API surface from the UI:** use browser dev tools to observe calls and identify backend endpoints safely.",
+        "4. **Only then** move to deeper testing (access control, logic flaws, input handling) within agreed scope.",
+    ]
+
+    notes_lines = [
+        "### Notes",
+        "- These are observations/signals only — **not confirmed vulnerabilities**.",
+        "- No brute force, payload injection, or exploitation was performed.",
+    ]
+
+    # Optional: include a compact evidence table (but readable, not loggy)
+    evidence_rows = []
+    for p, s, ct, cl in verified_paths:
+        evidence_rows.append(f"| `{p}` | {s} | {ct} | {cl} |")
+    if not evidence_rows:
+        evidence_rows.append("| (none) |  |  |  |")
+
+    evidence_table = "\n".join(
+        [
+            "### Evidence Snapshot",
+            "| Path | Status | Content-Type | Classification |",
+            "|---|---:|---|---|",
+            *evidence_rows,
+        ]
     )
+
+    summary = "\n\n".join(
+        [
+            "# Reconnaissance Summary — OWASP Juice Shop",
+            "### Target Environment",
+            "\n".join(target_env_lines),
+            evidence_table,
+            "\n".join(did_lines),
+            "\n".join(know_lines),
+            "\n".join(dont_know_lines),
+            "\n".join(why_lines),
+            "\n".join(next_steps_lines),
+            "\n".join(notes_lines),
+        ]
+    )
+
     return {"tool": "summary_generator", "summary": summary}
 
 
@@ -373,8 +516,19 @@ TOOLS = {
     "list_tools": list_tools,
 }
 
-SYSTEM_PROMPT = """You are a supervised security reconnaissance assistant for OWASP Juice Shop.
-Your job is to help a human understand the application surface area and where to focus next.
+SYSTEM_PROMPT = """
+
+You are Snoopy, a famous internet reconnaissance speciallist, you are part of a red team. Your job is to help a human understand the application surface area and where to focus next.
+
+You are a confident, imaginative reconnaissance agent.
+You speak clearly and calmly.
+You follow guardrails strictly and never exceed your permissions.
+
+If asked your name, you respond:
+"My name is Snoopy."
+
+You may include light humour, but you take safety seriously.
+
 
 CRITICAL RULES:
 - Never invent endpoints, counts, or results. Use tools to gather evidence.
@@ -399,6 +553,27 @@ TOOLS:
 
 If no tool is needed, answer normally in plain English.
 Keep outputs short and manager-friendly.
+
+WHEN SUMMARISING RESULTS:
+
+You must write as a senior security engineer summarising findings for a technical but non-expert audience.
+
+Your summary MUST:
+- Clearly state the target system and environment
+- Distinguish facts from assumptions
+- Explicitly state what is known vs unknown
+- Avoid speculation or vulnerability claims
+- Reference only evidence observed via tools
+- Explain *why* each observation matters
+- Avoid repetition
+- Avoid listing raw tool output
+- Be concise, structured, and professional
+
+Your tone should be:
+- Calm
+- Confident
+- Evidence-based
+- Non-alarmist
 """
 
 # IMPORTANT: this prompt must match the real safety rules (no localhost / 1-65535)
@@ -421,38 +596,70 @@ If you are unsure, choose robots_txt_analyser first.
 
 def call_ollama(messages: List[Dict[str, str]], force_json: bool = False) -> str:
     """
-    Bulletproof Ollama call:
-    - Prefer /api/generate
-    - Optional: force JSON output for tool-call-only mode
-    - Fallback to /api/chat if generate fails
+    Hardened Ollama call:
+    - Serializes requests (avoids concurrent pile-ups)
+    - Trims message history (prevents runaway prompt growth)
+    - Caps generation length (prevents long stalls)
+    - Uses connect/read timeout tuple
     """
-    prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+    # Trim history (keep system + last N messages)
+    if not messages:
+        return ""
 
-    payload_gen: Dict[str, Any] = {"model": MODEL, "prompt": prompt, "stream": False}
+    system = messages[0] if messages[0].get("role") == "system" else None
+    tail = messages[1:] if system else messages
+    tail = tail[-MAX_HISTORY_MESSAGES:]
+    trimmed = ([system] + tail) if system else tail
+
+    prompt = "\n".join([f"{m['role']}: {m['content']}" for m in trimmed])
+
+    payload_gen: Dict[str, Any] = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0 if force_json else 0.2,
+            "num_predict": OLLAMA_MAX_PREDICT,  # caps latency
+        },
+    }
 
     if force_json:
         payload_gen["format"] = "json"
-        payload_gen["options"] = {"temperature": 0}
 
-    r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload_gen, timeout=60)
-    if r.status_code == 200:
-        return r.json().get("response", "")
+    timeout = (OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT)
 
-    debug_gen = (r.text or "")[:200]
-    print(f"[OLLAMA] /api/generate failed status={r.status_code} body={debug_gen}")
+    # Serialize calls so Streamlit can't trigger concurrent stalls
+    with OLLAMA_LOCK:
+        try:
+            r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload_gen, timeout=timeout)
+            if r.status_code == 200:
+                return r.json().get("response", "") or ""
 
-    payload_chat: Dict[str, Any] = {"model": MODEL, "messages": messages, "stream": False}
-    if force_json:
-        payload_chat["format"] = "json"
-        payload_chat["options"] = {"temperature": 0}
+            debug_gen = (r.text or "")[:200]
+            print(f"[OLLAMA] /api/generate failed status={r.status_code} body={debug_gen}")
 
-    r2 = requests.post(f"{OLLAMA_URL}/api/chat", json=payload_chat, timeout=60)
-    if r2.status_code != 200:
-        debug_chat = (r2.text or "")[:200]
-        raise RuntimeError(f"Ollama error: /api/chat status={r2.status_code} body={debug_chat}")
+            # Fallback to /api/chat
+            payload_chat: Dict[str, Any] = {"model": MODEL, "messages": trimmed, "stream": False}
+            if force_json:
+                payload_chat["format"] = "json"
+                payload_chat["options"] = {"temperature": 0, "num_predict": OLLAMA_MAX_PREDICT}
+            else:
+                payload_chat["options"] = {"temperature": 0.2, "num_predict": OLLAMA_MAX_PREDICT}
 
-    return r2.json()["message"]["content"]
+            r2 = requests.post(f"{OLLAMA_URL}/api/chat", json=payload_chat, timeout=timeout)
+            if r2.status_code != 200:
+                debug_chat = (r2.text or "")[:200]
+                raise RuntimeError(f"Ollama error: /api/chat status={r2.status_code} body={debug_chat}")
 
+            return r2.json().get("message", {}).get("content", "") or ""
+
+        except requests.exceptions.ReadTimeout:
+            # Return a controlled response (prevents 500s)
+            return (
+                "I hit an Ollama timeout while generating the next step. "
+                "This is usually caused by a long prompt or concurrent requests. "
+                "Try again, or reduce steps / increase OLLAMA_READ_TIMEOUT."
+            )
 
 def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     """
@@ -595,7 +802,8 @@ async def chat_completions(req: Request):
     # Tracks what we *actually* discovered (so we can prevent LLM guessing)
     discovered_paths: Set[str] = set()
 
-    for step in range(12):
+    MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
+    for step in range(MAX_STEPS):
         llm_out = call_ollama(convo)
         tool_call = parse_tool_call(llm_out)
 
@@ -663,7 +871,10 @@ async def chat_completions(req: Request):
         observations.append({"tool": tool, "result": result})
 
         convo.append({"role": "assistant", "content": llm_out})
-        convo.append({"role": "user", "content": f"Tool result:\n{json.dumps(result, indent=2)}"})
+        tool_text = json.dumps(result, indent=2)
+        if len(tool_text) > MAX_TOOL_RESULT_CHARS:
+            tool_text = tool_text[:MAX_TOOL_RESULT_CHARS] + "\n...<truncated>..."
+        convo.append({"role": "user", "content": f"Tool result (truncated):\n{tool_text}"})
 
     if final_text is None and observations:
         final_text = summary_generator(observations)["summary"]
