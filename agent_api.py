@@ -129,6 +129,34 @@ def is_general_question(text: str) -> bool:
 
     return any(k in t for k in non_recon_keywords)
 
+def is_list_tools_question(text: str) -> bool:
+    t = (text or "").lower().strip()
+    triggers = [
+        "what tools can you use",
+        "what tools do you have",
+        "what tools are available",
+        "list the tools",
+        "list tools",
+        "show tools",
+        "tool list",
+    ]
+    return any(x in t for x in triggers)
+
+def is_guardrails_question(text: str) -> bool:
+    t = (text or "").lower().strip()
+    triggers = [
+        "guardrails",
+        "restrictions",
+        "rules",
+        "what are you allowed",
+        "what are you not allowed",
+        "what can't you do",
+        "what cannot you do",
+        "explicitly not allowed",
+        "not allowed",
+    ]
+    return any(x in t for x in triggers)
+
 # -------------------------
 # Safe path policy (prevents LLM guessing garbage routes)
 # -------------------------
@@ -171,10 +199,89 @@ def is_safe_path(p: str, discovered: Set[str]) -> bool:
 
     return (p in SAFE_SEED_PATHS) or (p in discovered)
 
+
+from datetime import datetime, timezone
+
+
+
+
+
+def not_allowed_rules() -> dict:
+    """
+    Return ONLY the explicitly-not-allowed list.
+    """
+    not_allowed = [
+        "Exploitation or attempting to gain unauthorised access",
+        "Sending attack payloads (SQLi/XSS/RCE etc.)",
+        "Brute force / credential guessing",
+        "Denial-of-service or resource exhaustion",
+        "Nmap scripts (-sC), NSE, OS detection (-O), aggressive scans (-A), UDP scans",
+        "Inventing endpoints, results, or vulnerabilities",
+    ]
+
+    return {
+        "tool": "not_allowed_rules",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "explicitly_not_allowed": not_allowed,
+    }
+
+
+def guardrails_enforced() -> dict:
+    """
+    Return ONLY the guardrails enforced by code.
+    """
+    guardrails = [
+        "Only tools in the allowlist (TOOLS dict) can be executed",
+        "Tools accept constrained JSON args; unexpected fields are ignored/rejected by code",
+        "HTTP tools are GET-only and do not follow redirects",
+        "nmap_scan is hard-coded to safe flags (-sT -Pn) and has a timeout",
+        "nmap_scan target is enforced to JUICE_TARGET (container scope only)",
+        "Agent loop stops if the model fails to produce valid tool-call JSON (demo safety)",
+        "Summary generation is controller-only (the model cannot trigger summary_generator)",
+        "Non-discovered/unknown paths are blocked (prevents LLM guessing / credibility loss)",
+    ]
+
+    return {
+        "tool": "guardrails_enforced",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "guardrails_enforced_by_code": guardrails,
+    }
+
+
+def describe_target() -> dict:
+    """
+    Return ONLY the in-scope target information.
+    This prevents the LLM inventing or summarising.
+    """
+    # Keep it deterministic and boring on purpose.
+    # Prefer JUICE_BASE because it reflects the running container address/port.
+    return {
+        "tool": "describe_target",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "application": "OWASP Juice Shop",
+        "target_url": JUICE_BASE,
+        "scope_note": "Container-scoped target only (no host scanning).",
+    }
+
+
+def list_tools_table() -> dict:
+    tools = list_tools()["tools"]
+    rows = [{"tool": t["name"], "purpose": t["description"]} for t in tools]
+    return {
+        "tool": "list_tools_table",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "table": {"columns": ["tool", "purpose"], "rows": rows},
+    }
+
+
+
+
 # -------------------------
-# Tool registry metadata
+# Tools
 # -------------------------
+
 def list_tools() -> dict:
+    # This is MODEL-FACING metadata: only include what you want the LLM to know exists.
     return {
         "tool": "list_tools",
         "tools": [
@@ -198,22 +305,37 @@ def list_tools() -> dict:
                 "description": "Confirm the Juice Shop service port is reachable on the container target (no host scanning).",
                 "safety": "Target restricted to JUICE_TARGET, port 3000 only. No host scanning.",
             },
+
+            # Deterministic capability tools (Option B)
+            {
+                "name": "describe_target",
+                "description": "Return the in-scope target URL and scope note (deterministic).",
+                "safety": "Read-only metadata; no external actions.",
+            },
+            {
+                "name": "list_tools_table",
+                "description": "Return ONLY a table of approved tools (tool + purpose).",
+                "safety": "Read-only metadata; returns tools list only.",
+            },
+            {
+                "name": "not_allowed_rules",
+                "description": "Return ONLY the explicitly-not-allowed actions list.",
+                "safety": "Read-only metadata; returns restrictions only.",
+            },
+            {
+                "name": "guardrails_enforced",
+                "description": "Return ONLY the guardrails enforced by code.",
+                "safety": "Read-only metadata; returns guardrails only.",
+            },
+
             {
                 "name": "summary_generator",
                 "description": "Produce a manager-friendly summary from collected observations.",
                 "safety": "Presentation only, no data collection.",
             },
-            {
-                "name": "capabilities_and_rules",
-                "description": "Return a deterministic table of approved tools, what each does, expected inputs, and enforced safety constraints.",
-                "safety": "No external actions; returns only capability/policy metadata.",
-            },
         ],
     }
 
-# -------------------------
-# Tools
-# -------------------------
 def http_get(path: str = "/") -> dict:
     path = normalise_path(path)
 
@@ -574,18 +696,10 @@ def capabilities_and_rules() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "table": {"columns": ["tool", "purpose", "inputs", "safety_model"], "rows": rows},
         "explicitly_not_allowed": not_allowed,
-        "guardrails_enforced_by_code": guardrails,
+        "guardrails_enforced_by_code": guardrails
     }
 
-TOOLS = {
-    "http_get": http_get,
-    "robots_txt_analyser": robots_txt_analyser,
-    "content_type_check": content_type_check,
-    "nmap_scan": nmap_scan,
-    "summary_generator": summary_generator,
-    "capabilities_and_rules": capabilities_and_rules,
-    "list_tools": list_tools,
-}
+
 
 SYSTEM_PROMPT = """
 You are Snoopy, a famous internet reconnaissance specialist, part of a red team.
@@ -831,6 +945,30 @@ def deterministic_capabilities_markdown() -> str:
 
     return "\n".join(md)
 
+def build_tools() -> dict:
+    return {
+        "http_get": http_get,
+        "robots_txt_analyser": robots_txt_analyser,
+        "content_type_check": content_type_check,
+        "nmap_scan": nmap_scan,
+        "summary_generator": summary_generator,
+
+        # Option B deterministic tools
+        "list_tools_table": list_tools_table,
+        "not_allowed_rules": not_allowed_rules,
+        "guardrails_enforced": guardrails_enforced,
+        "describe_target": describe_target,
+
+        # metadata tools
+        "list_tools": list_tools,
+
+        # optional legacy tool (not model-facing)
+        "capabilities_and_rules": capabilities_and_rules,
+    }
+
+TOOLS = build_tools()
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     body = await req.json()
@@ -871,23 +1009,71 @@ async def chat_completions(req: Request):
         }
         return JSONResponse(resp)
 
-    # --- Deterministic shortcut for demo-quality answers about tools/rules ---
-    # ✅ ABSOLUTE PRIORITY: tools / rules questions
-    if is_tools_question(last_user):
+    # ✅ DETERMINISTIC METADATA QUESTIONS (NO RECON)
+    # 1) Guardrails / rules question
+        # ✅ DETERMINISTIC METADATA QUESTIONS (NO RECON)
+    if is_guardrails_question(last_user):
+        tl = (last_user or "").lower()
+
+        # If they ask about "not allowed", return that list
+        if ("not allowed" in tl) or ("can't" in tl) or ("cannot" in tl) or ("explicitly" in tl):
+            n = not_allowed_rules()
+            lines = ["explicitly_not_allowed"]
+            for x in n["explicitly_not_allowed"]:
+                lines.append(f"- {x}")
+            answer = "\n".join(lines)
+        else:
+            g = guardrails_enforced()
+            lines = ["guardrails_enforced_by_code"]
+            for x in g["guardrails_enforced_by_code"]:
+                lines.append(f"- {x}")
+            answer = "\n".join(lines)
+
         return JSONResponse({
             "id": "chatcmpl-agentic-demo",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": deterministic_capabilities_markdown(),
-                },
+                "message": {"role": "assistant", "content": answer},
                 "finish_reason": "stop",
             }],
             "model": MODEL,
         })
-    # --- end shortcut ---
+
+    if is_list_tools_question(last_user):
+        t = list_tools_table()
+        md = ["tool | purpose", "--- | ---"]
+        for r in t["table"]["rows"]:
+            md.append(f"{r['tool']} | {r['purpose']}")
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "\n".join(md)},
+                "finish_reason": "stop",
+            }],
+            "model": MODEL,
+        })
+
+
+    # 2) “List tools” question
+    if is_list_tools_question(last_user):
+        t = list_tools_table()
+        md = ["tool | purpose", "--- | ---"]
+        for r in t["table"]["rows"]:
+            md.append(f"{r['tool']} | {r['purpose']}")
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "\n".join(md)},
+                "finish_reason": "stop",
+            }],
+            "model": MODEL,
+        })
+
 
     # ✅ GENERAL CHAT / NON-RECON QUESTIONS
     if is_general_question(last_user):
@@ -1009,6 +1195,8 @@ async def chat_completions(req: Request):
         "model": MODEL,
     }
     return JSONResponse(resp)
+
+
 
 @app.get("/health")
 def health():

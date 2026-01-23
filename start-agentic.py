@@ -1,19 +1,21 @@
-#      Andrew Buchanan - Jan 2026
-#      Agentic demo stack launcher
-#      - Starts Juice Shop in Docker
-#      - Starts Ollama server (if not running)
-#      - Starts agent_api Uvicorn server
-#      - Starts Streamlit UI    
-
 #!/usr/bin/env python3
+#
+#  Andrew Buchanan - Jan 2026
+#  Agentic demo stack launcher
+#  - Starts Juice Shop in Docker
+#  - Starts Ollama server (if not running)
+#  - Starts agent_api Uvicorn server
+#  - Starts Streamlit UI
+
 import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.request import urlopen, Request as UrlRequest
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
 ROOT_DIR = Path("/home/buchaae/agentic-demo")
 UI_DIR = ROOT_DIR / "agent-ui"
@@ -46,7 +48,7 @@ def http_ok(url: str, timeout: float = 1.5) -> bool:
     try:
         req = UrlRequest(url, headers={"User-Agent": "demo-launcher"})
         with urlopen(req, timeout=timeout) as r:
-            return 200 <= r.status < 500
+            return 200 <= getattr(r, "status", 200) < 500
     except HTTPError as e:
         return 200 <= e.code < 500
     except URLError:
@@ -92,7 +94,6 @@ def docker_stop_rm(name: str):
     # Safe stop/remove if exists
     if docker_container_exists(name):
         subprocess.call(["bash", "-lc", f"docker stop {name} >/dev/null 2>&1 || true"])
-        # If it was not --rm (or stop didn’t remove), remove explicitly
         subprocess.call(["bash", "-lc", f"docker rm {name} >/dev/null 2>&1 || true"])
 
 
@@ -106,11 +107,9 @@ def get_container_ip(name: str) -> str:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        if ip:
-            return ip
+        return ip or ""
     except Exception:
-        pass
-    return ""
+        return ""
 
 
 def cleanup(*_):
@@ -155,45 +154,26 @@ def main():
     # Optional: pre-pull juice-shop image (avoids demo lag)
     subprocess.call(["docker", "pull", "bkimminich/juice-shop"])
 
-# 0) Demo hygiene: stop/remove any previous named container
-docker_stop_rm(JUICE_CONTAINER_NAME)
+    # 0) Demo hygiene: stop/remove any previous named container
+    docker_stop_rm(JUICE_CONTAINER_NAME)
 
-# 1) Start Juice Shop (docker) - detached and named so we can inspect IP
-print(f"[INFO] Starting Juice Shop container '{JUICE_CONTAINER_NAME}'...")
-subprocess.check_call(
-    [
-        "docker", "run",
-        "-d", "--rm",
-        "--name", JUICE_CONTAINER_NAME,
-        "-p", f"{JUICE_EXTERNAL_PORT}:{JUICE_INTERNAL_PORT}",
-        "bkimminich/juice-shop",
-    ],
-    cwd=str(ROOT_DIR),
-)
+    # 1) Start Juice Shop (docker) - detached and named so we can inspect IP
+    print(f"[INFO] Starting Juice Shop container '{JUICE_CONTAINER_NAME}'...")
+    subprocess.check_call(
+        [
+            "docker", "run",
+            "-d", "--rm",
+            "--name", JUICE_CONTAINER_NAME,
+            "-p", f"{JUICE_EXTERNAL_PORT}:{JUICE_INTERNAL_PORT}",
+            "bkimminich/juice-shop",
+        ],
+        cwd=str(ROOT_DIR),
+    )
 
-wait_for(JUICE_URL, "Juice Shop (external)", seconds=45)
+    # Wait for external port mapping to respond
+    wait_for(JUICE_URL, "Juice Shop (external)", seconds=45)
 
-# Resolve container IP
-juice_ip = ""
-for _ in range(30):
-    juice_ip = get_container_ip(JUICE_CONTAINER_NAME)
-    if juice_ip:
-        break
-    time.sleep(0.5)
-
-if not juice_ip:
-    print("[WARN] Could not determine container IP; falling back to localhost mapping (less ideal).")
-    juice_base = JUICE_URL
-    juice_target = "127.0.0.1"
-    juice_target_port = JUICE_EXTERNAL_PORT
-else:
-    juice_base = f"http://{juice_ip}:{JUICE_INTERNAL_PORT}"
-    juice_target = juice_ip
-    juice_target_port = JUICE_INTERNAL_PORT
-    print(f"[OK] Juice Shop container IP: {juice_ip}")
-    print(f"[OK] Agent JUICE_BASE (internal): {juice_base}")
-
-    # Fetch internal container IP for agent targeting
+    # Resolve container IP (for internal agent targeting)
     juice_ip = ""
     for _ in range(30):
         juice_ip = get_container_ip(JUICE_CONTAINER_NAME)
@@ -202,8 +182,7 @@ else:
         time.sleep(0.5)
 
     if not juice_ip:
-        print("[WARN] Could not determine container IP. Falling back to external mapping for agent (less ideal).")
-        # fallback: agent will use localhost mapping (works but scans can hit host if misused)
+        print("[WARN] Could not determine container IP; falling back to localhost mapping (less ideal).")
         juice_base = JUICE_URL
         juice_target = "127.0.0.1"
         juice_target_port = JUICE_EXTERNAL_PORT
@@ -223,8 +202,8 @@ else:
 
     # Prepare shared env for agent services
     base_env = os.environ.copy()
-    base_env["JUICE_BASE"] = juice_base          # used by your agent_api tools (http_get etc.)
-    base_env["JUICE_TARGET"] = juice_target      # optional: useful if you update nmap_scan to use it
+    base_env["JUICE_BASE"] = juice_base
+    base_env["JUICE_TARGET"] = juice_target
     base_env["JUICE_TARGET_PORT"] = str(juice_target_port)
 
     # 3) Start Uvicorn API (agent_api.py is in ROOT_DIR)
@@ -239,10 +218,8 @@ else:
         [
             str(uvicorn_bin),
             "agent_api:app",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
+            "--host", "0.0.0.0",
+            "--port", "8000",
         ],
         cwd=str(ROOT_DIR),
         env=base_env,
@@ -255,7 +232,7 @@ else:
         "streamlit-ui",
         [str(py), "-m", "streamlit", "run", "app.py"],
         cwd=str(UI_DIR),
-        env=base_env,  # so UI can display target / pass through if needed
+        env=base_env,
     )
     wait_for(UI_URL, "Streamlit UI", seconds=30)
 
