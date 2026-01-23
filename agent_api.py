@@ -343,6 +343,11 @@ def list_tools() -> dict:
                 "description": "Produce a manager-friendly summary from collected observations.",
                 "safety": "Presentation only, no data collection.",
             },
+            {
+                "name": "ftp_audit",
+                "description": "Fetch /ftp listing, download small previews of text files, and triage exposure risk via LLM (bounded + safe).",
+                "safety": "GET-only; /ftp only; text extensions only; hard caps on bytes and file count."
+            },
         ],
     }
 
@@ -499,6 +504,128 @@ def nmap_scan(target: str = None, ports: str = None) -> dict:
         resp["error"] = f"nmap returned non-zero exit code {proc.returncode}"
 
     return resp
+
+import re
+from html import unescape
+
+def ftp_audit(max_files: int = 25, max_bytes_per_file: int = 8000) -> dict:
+    """
+    Fetch /ftp listing, pull out text-ish files, download small previews,
+    and ask the LLM to triage whether anything looks risky to be internet-exposed.
+
+    Safety:
+      - GET only
+      - Only /ftp and /ftp/<file>
+      - Only text-like extensions
+      - Hard caps on file count and bytes
+    """
+    base = JUICE_BASE.rstrip("/")
+    listing_url = f"{base}/ftp"
+    r = requests.get(listing_url, timeout=10, allow_redirects=False)
+
+    if not r.ok:
+        return {
+            "tool": "ftp_audit",
+            "error": f"Failed to fetch /ftp listing: HTTP {r.status_code}",
+            "listing_url": listing_url,
+        }
+
+    html = r.text or ""
+
+    # Pull hrefs. Juice Shop /ftp is usually a simple listing page.
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    hrefs = [unescape(h.strip()) for h in hrefs if h]
+
+    # Normalise candidates -> just filenames under /ftp
+    candidates = []
+    for h in hrefs:
+        # Accept "/ftp/<name>" or "<name>"
+        if h.startswith("/ftp/"):
+            name = h[len("/ftp/"):]
+        elif h.startswith("ftp/"):
+            name = h[len("ftp/"):]
+        else:
+            name = h
+
+        name = name.strip().lstrip("/")
+        if not name or "/" in name:
+            continue  # avoid nested paths
+        candidates.append(name)
+
+    # Filter to “text-ish” files (safe default)
+    allow_ext = (".txt", ".md", ".log", ".csv", ".json", ".xml", ".yml", ".yaml", ".conf", ".ini")
+    text_files = [c for c in candidates if c.lower().endswith(allow_ext)]
+    text_files = _uniq_preserve(text_files)[:max_files]
+
+    fetched = []
+    for name in text_files:
+        file_url = f"{base}/ftp/{name}"
+        try:
+            fr = requests.get(file_url, timeout=10, allow_redirects=False)
+        except Exception as e:
+            fetched.append({"file": name, "url": file_url, "error": str(e)})
+            continue
+
+        ct = (fr.headers.get("content-type") or "").lower()
+        body = fr.text if fr.ok else ""
+        preview = (body or "")[:max_bytes_per_file]
+
+        fetched.append({
+            "file": name,
+            "url": file_url,
+            "status_code": fr.status_code,
+            "content_type": ct,
+            "preview": preview,
+            "truncated": len(body) > len(preview),
+        })
+
+    # Build a tight triage prompt for the LLM
+    prompt = """
+You are a security reviewer. You are given a set of files that appear publicly accessible under /ftp.
+Your job is to triage exposure risk based ONLY on the provided file previews.
+
+Return STRICT JSON with:
+{
+  "overall_risk": "none|low|medium|high",
+  "highlights": [ "short bullet", ... ],
+  "files": [
+    {
+      "file": "...",
+      "risk": "none|low|medium|high",
+      "why": "1-2 sentences grounded in preview",
+      "what_to_do": "1 sentence action"
+    }
+  ]
+}
+
+Rules:
+- Do NOT assume content that isn't shown.
+- Treat anything that looks like credentials, secrets, access tokens, keys, internal endpoints, PII, logs with session IDs,
+  stack traces, configs, backups, or source code fragments as potentially risky.
+- If the preview is too small to judge, say so and set risk to low/medium appropriately with "needs full review".
+"""
+
+    # Only pass the minimal necessary content to the model
+    evidence = [{"file": x.get("file"), "preview": x.get("preview", ""), "truncated": x.get("truncated", False)} for x in fetched]
+    llm_in = prompt.strip() + "\n\nFILES_PREVIEWS:\n" + json.dumps(evidence, ensure_ascii=False)
+
+    # Call Ollama directly (controller-side), forcing JSON
+    llm_out = call_ollama([{"role": "system", "content": "Return JSON only."},
+                           {"role": "user", "content": llm_in}], force_json=True)
+
+    triage = None
+    try:
+        triage = json.loads(llm_out)
+    except Exception:
+        triage = {"error": "Model did not return valid JSON", "raw": (llm_out or "")[:1200]}
+
+    return {
+        "tool": "ftp_audit",
+        "listing_url": listing_url,
+        "files_considered": text_files,
+        "files_fetched": fetched,
+        "llm_triage": triage,
+    }
 
 def _is_docker_bridge_ip(host: str) -> bool:
     # Common Docker default bridge ranges
@@ -804,6 +931,7 @@ Allowed tools:
 - content_type_check (args: {"paths":["/","/robots.txt","/ftp","/admin"]})
 - nmap_scan (args: {"target":"JUICE_TARGET","ports":"3000,4000,4001,4002"})  # only at the very end, if needed
 - capabilities_and_rules (args: {})
+- ftp_audit (args: {"max_files":25,"max_bytes_per_file":8000})
 
 If you are unsure, choose robots_txt_analyser first.
 """
@@ -1013,6 +1141,7 @@ def build_tools() -> dict:
         "not_allowed_rules": not_allowed_rules,
         "guardrails_enforced": guardrails_enforced,
         "describe_target": describe_target,
+        "ftp_audit": ftp_audit,
 
         # metadata tools
         "list_tools": list_tools,
