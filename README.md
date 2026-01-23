@@ -50,6 +50,7 @@ Summarise what we know, what we don’t know yet, and where a human security eng
 What evidence supports your conclusions, and what assumptions did you avoid making?
 
 
+test!!!!
 
 export OLLAMA_MODEL="llama3.1:8b"
 
