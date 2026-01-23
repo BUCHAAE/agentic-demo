@@ -3,6 +3,7 @@
 #  Andrew Buchanan - Jan 2026
 #  Agentic demo stack launcher
 #  - Starts Juice Shop in Docker
+#  - Starts 3 "sidecar" services on extra ports (4000-4002) inside the same container network namespace
 #  - Starts Ollama server (if not running)
 #  - Starts agent_api Uvicorn server
 #  - Starts Streamlit UI
@@ -29,6 +30,26 @@ JUICE_CONTAINER_NAME = "juice-shop"
 JUICE_INTERNAL_PORT = "3000"  # inside container
 JUICE_EXTERNAL_PORT = "3001"  # host mapped port
 
+# Sidecar containers (share network namespace with juice-shop)
+SIDECARS = [
+    {
+        "name": "juice-echo-4000",
+        "port": "4000",
+        "text": "health OK",
+    },
+    {
+        "name": "juice-echo-4001",
+        "port": "4001",
+        "text": "metrics endpoint",
+    },
+    {
+        "name": "juice-echo-4002",
+        "port": "4002",
+        "text": "debug interface",
+    },
+]
+SIDECAR_IMAGE = "hashicorp/http-echo:1.0"
+
 API_URL = "http://127.0.0.1:8000"
 UI_URL = "http://127.0.0.1:8501"
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -43,7 +64,7 @@ def which(cmd: str) -> bool:
 def http_ok(url: str, timeout: float = 1.5) -> bool:
     """
     Return True if a web server is reachable.
-    Note: urllib raises HTTPError for 4xx/5xx; for 'is it up?' checks we treat 4xx as up.
+    Treat 4xx as "up" for service checks.
     """
     try:
         req = UrlRequest(url, headers={"User-Agent": "demo-launcher"})
@@ -86,21 +107,16 @@ def venv_python() -> Path:
 
 
 def docker_container_exists(name: str) -> bool:
-    rc = subprocess.call(["bash", "-lc", f"docker inspect {name} >/dev/null 2>&1"])
-    return rc == 0
+    return subprocess.call(["bash", "-lc", f"docker inspect {name} >/dev/null 2>&1"]) == 0
 
 
 def docker_stop_rm(name: str):
-    # Safe stop/remove if exists
     if docker_container_exists(name):
         subprocess.call(["bash", "-lc", f"docker stop {name} >/dev/null 2>&1 || true"])
         subprocess.call(["bash", "-lc", f"docker rm {name} >/dev/null 2>&1 || true"])
 
 
 def get_container_ip(name: str) -> str:
-    """
-    Return Docker bridge IP for a running container.
-    """
     try:
         ip = subprocess.check_output(
             ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name],
@@ -110,6 +126,32 @@ def get_container_ip(name: str) -> str:
         return ip or ""
     except Exception:
         return ""
+
+
+def start_sidecars():
+    # Pull once (no lag during demo)
+    subprocess.call(["docker", "pull", SIDECAR_IMAGE])
+
+    for sc in SIDECARS:
+        docker_stop_rm(sc["name"])
+        print(f"[INFO] Starting sidecar {sc['name']} on :{sc['port']} (inside juice-shop netns)")
+        subprocess.check_call(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                sc["name"],
+                "--network",
+                f"container:{JUICE_CONTAINER_NAME}",
+                SIDECAR_IMAGE,
+                "-listen",
+                f":{sc['port']}",
+                "-text",
+                sc["text"],
+            ]
+        )
 
 
 def cleanup(*_):
@@ -133,7 +175,12 @@ def cleanup(*_):
             except Exception:
                 pass
 
-    # Stop the named container (detached run)
+    # Stop sidecars
+    for sc in SIDECARS:
+        print(f"[STOP] docker container: {sc['name']}")
+        docker_stop_rm(sc["name"])
+
+    # Stop main container
     print(f"[STOP] docker container: {JUICE_CONTAINER_NAME}")
     docker_stop_rm(JUICE_CONTAINER_NAME)
 
@@ -145,32 +192,36 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    # Basic tool checks
-    for tool in ["docker", "ollama"]:
+    for tool in ["docker", "ollama", "nmap"]:
         if not which(tool):
             print(f"[ERROR] Missing required command: {tool}")
             sys.exit(1)
 
-    # Optional: pre-pull juice-shop image (avoids demo lag)
+    # Pull Juice Shop (avoids demo lag)
     subprocess.call(["docker", "pull", "bkimminich/juice-shop"])
 
-    # 0) Demo hygiene: stop/remove any previous named container
+    # Hygiene: stop previous runs
+    for sc in SIDECARS:
+        docker_stop_rm(sc["name"])
     docker_stop_rm(JUICE_CONTAINER_NAME)
 
-    # 1) Start Juice Shop (docker) - detached and named so we can inspect IP
+    # 1) Start Juice Shop (ONLY map 3001 -> 3000)
     print(f"[INFO] Starting Juice Shop container '{JUICE_CONTAINER_NAME}'...")
     subprocess.check_call(
         [
-            "docker", "run",
-            "-d", "--rm",
-            "--name", JUICE_CONTAINER_NAME,
-            "-p", f"{JUICE_EXTERNAL_PORT}:{JUICE_INTERNAL_PORT}",
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            JUICE_CONTAINER_NAME,
+            "-p",
+            f"{JUICE_EXTERNAL_PORT}:{JUICE_INTERNAL_PORT}",
             "bkimminich/juice-shop",
         ],
         cwd=str(ROOT_DIR),
     )
 
-    # Wait for external port mapping to respond
     wait_for(JUICE_URL, "Juice Shop (external)", seconds=45)
 
     # Resolve container IP (for internal agent targeting)
@@ -193,6 +244,9 @@ def main():
         print(f"[OK] Juice Shop container IP: {juice_ip}")
         print(f"[OK] Agent JUICE_BASE (internal): {juice_base}")
 
+    # 1b) Start sidecars (creates extra open ports on the SAME container IP)
+    start_sidecars()
+
     # 2) Start Ollama server (if it isn't already)
     if not http_ok(OLLAMA_URL):
         start_process("ollama-serve", ["ollama", "serve"], cwd=str(ROOT_DIR))
@@ -200,13 +254,15 @@ def main():
     else:
         print(f"[OK] Ollama already up: {OLLAMA_URL}")
 
-    # Prepare shared env for agent services
+    # Shared env for agent services
     base_env = os.environ.copy()
     base_env["JUICE_BASE"] = juice_base
     base_env["JUICE_TARGET"] = juice_target
     base_env["JUICE_TARGET_PORT"] = str(juice_target_port)
+    # Let nmap_scan default to scanning these ports (agent_api can read it)
+    base_env["JUICE_SCAN_PORTS"] = "3000,4000,4001,4002"
 
-    # 3) Start Uvicorn API (agent_api.py is in ROOT_DIR)
+    # 3) Start Uvicorn API
     uvicorn_bin = VENV_DIR / "bin" / "uvicorn"
     if not uvicorn_bin.exists():
         print(f"[ERROR] uvicorn not found in venv: {uvicorn_bin}")
@@ -215,18 +271,13 @@ def main():
 
     start_process(
         "uvicorn-api",
-        [
-            str(uvicorn_bin),
-            "agent_api:app",
-            "--host", "0.0.0.0",
-            "--port", "8000",
-        ],
+        [str(uvicorn_bin), "agent_api:app", "--host", "0.0.0.0", "--port", "8000"],
         cwd=str(ROOT_DIR),
         env=base_env,
     )
     wait_for(API_URL, "Agent API", seconds=30)
 
-    # 4) Start Streamlit UI (app.py is in agent-ui)
+    # 4) Start Streamlit UI
     py = venv_python()
     start_process(
         "streamlit-ui",
@@ -242,9 +293,9 @@ def main():
     print(f"  Ollama               : {OLLAMA_URL}")
     print(f"  API                  : {API_URL}")
     print(f"  Streamlit            : {UI_URL}")
+    print("  Extra open ports     : 4000, 4001, 4002 (sidecars in same netns)")
     print("\nPress Ctrl+C to stop everything.")
 
-    # Keep running while processes run
     while True:
         time.sleep(1)
         for label, p in PROCS:

@@ -20,7 +20,18 @@ MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 # Launcher should inject these (container-scoped). Defaults are fallback only.
 JUICE_BASE = os.getenv("JUICE_BASE", "http://127.0.0.1:3001")
-JUICE_TARGET = os.getenv("JUICE_TARGET", "127.0.0.1")
+
+def derive_target_from_base(base_url: str, fallback: str) -> str:
+    try:
+        u = urlparse(base_url)
+        return u.hostname or fallback
+    except Exception:
+        return fallback
+
+# Launcher can override; otherwise derive from JUICE_BASE
+JUICE_TARGET = os.getenv("JUICE_TARGET") or derive_target_from_base(JUICE_BASE, "127.0.0.1")
+
+# Keep this for completeness / future-proofing
 JUICE_TARGET_PORT = os.getenv("JUICE_TARGET_PORT", "3000")
 
 # Ollama stability controls
@@ -302,10 +313,9 @@ def list_tools() -> dict:
             },
             {
                 "name": "nmap_scan",
-                "description": "Confirm the Juice Shop service port is reachable on the container target (no host scanning).",
-                "safety": "Target restricted to JUICE_TARGET, port 3000 only. No host scanning.",
+                "description": "Confirm the Juice Shop service ports are reachable on the container target (demo-safe limited port check).",
+                "safety": "Target restricted to JUICE_TARGET. Ports restricted to 3000,4000,4001,4002 only.",
             },
-
             # Deterministic capability tools (Option B)
             {
                 "name": "describe_target",
@@ -398,52 +408,97 @@ def content_type_check(path=None, paths=None) -> dict:
 
     return {"tool": "content_type_check", "results": results}
 
+
+def run_recon_pipeline() -> str:
+    observations = []
+
+    r1 = robots_txt_analyser()
+    observations.append({"tool": "robots_txt_analyser", "result": r1})
+
+    r2 = content_type_check(paths=["/", "/robots.txt", "/ftp", "/admin"])
+    observations.append({"tool": "content_type_check", "result": r2})
+
+    r3 = nmap_scan(ports="3000,4000,4001,4002")
+    observations.append({"tool": "nmap_scan", "result": r3})
+
+    return summary_generator(observations)["summary"]
+
+
+
 def nmap_scan(target: str = None, ports: str = None) -> dict:
     """
-    Demo-safe: only allow scanning the Juice Shop container target.
-    Default ports restricted to the app port only.
+    Demo-safe: scan ONLY the host derived from JUICE_BASE (i.e. the actual target you're HTTP-fetching).
+    Ports:
+      - default: small allowlist
+      - if caller asks for "all", scan 1-65535 (still TCP connect scan, still -Pn, still timeout guarded)
+      - otherwise accept a ports string but clamp length to avoid runaway scans
     """
-    safe_target = JUICE_TARGET
-    safe_ports = ports or JUICE_TARGET_PORT or "3000"
+    # Always derive the real host from JUICE_BASE at call time
+    safe_target = derive_target_from_base(JUICE_BASE, "127.0.0.1")
 
-    # Hard block: only allow target == JUICE_TARGET
-    if target is None:
-        target = safe_target
-    if target != safe_target:
+    # Decide ports
+    safe_ports_default = "3000,4000,4001,4002"
+    requested = (ports or "").strip().lower()
+
+    if requested in ("all", "1-65535", "1-65536"):
+        safe_ports = "1-65535"
+        timeout_s = 120
+    elif requested:
+        # Keep it bounded: reject obviously huge strings / nonsense
+        if len(requested) > 60:
+            return {
+                "tool": "nmap_scan",
+                "target": safe_target,
+                "ports": safe_ports_default,
+                "error": "Blocked by policy: requested ports string too long",
+            }
+        safe_ports = requested
+        timeout_s = 90
+    else:
+        safe_ports = safe_ports_default
+        timeout_s = 60
+
+    # Enforce target (ignore caller)
+    if target is not None and str(target) != str(safe_target):
         return {
             "tool": "nmap_scan",
             "target": target,
             "ports": safe_ports,
-            "error": f"Blocked by policy: nmap_scan target must be JUICE_TARGET ({safe_target})",
+            "error": f"Blocked by policy: nmap_scan target must match JUICE_BASE host ({safe_target})",
         }
 
-    # Hard block: prevent full-range scans in demo
-    if safe_ports.strip() in ("1-65535", "0-65535", "1-65536"):
-        safe_ports = JUICE_TARGET_PORT or "3000"
+    # 🔍 DEBUG / DEMO VISIBILITY
+    print(f"[NMAP] Scanning target IP {safe_target} ports {safe_ports}", flush=True)
 
-    cmd = ["nmap", "-sT", "-Pn", "-p", str(safe_ports), str(target)]
+    cmd = ["nmap", "-sT", "-Pn", "-p", safe_ports, str(safe_target)]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except Exception as e:
-        return {"tool": "nmap_scan", "target": target, "ports": safe_ports, "error": str(e)}
+        return {"tool": "nmap_scan", "target": safe_target, "ports": safe_ports, "error": str(e)}
 
     open_ports = []
     for line in proc.stdout.splitlines():
-        if "/tcp" in line and "open" in line:
+        # typical line: "3000/tcp open  http"
+        if "/tcp" in line and " open " in f" {line} ":
             parts = line.split()
             if len(parts) >= 3:
                 open_ports.append({"port": parts[0], "state": parts[1], "service": parts[2]})
 
-    return {
+    resp = {
         "tool": "nmap_scan",
-        "target": target,
+        "target": safe_target,
         "ports": safe_ports,
         "open_ports": open_ports,
         "raw_output_preview": proc.stdout[:800],
         "return_code": proc.returncode,
         "stderr_preview": (proc.stderr or "")[:400],
     }
+
+    if proc.returncode != 0:
+        resp["error"] = f"nmap returned non-zero exit code {proc.returncode}"
+
+    return resp
 
 def _is_docker_bridge_ip(host: str) -> bool:
     # Common Docker default bridge ranges
@@ -655,7 +710,7 @@ def capabilities_and_rules() -> dict:
         "http_get": {"path": "/"},
         "robots_txt_analyser": {},
         "content_type_check": {"paths": ["/", "/robots.txt", "/ftp", "/admin"]},
-        "nmap_scan": {"target": "JUICE_TARGET", "ports": "3000"},
+        "nmap_scan": {"target": "JUICE_TARGET", "ports": "3000,4000,4001,4002"},
         "summary_generator": {"observations": "[controller-only]"},
         "capabilities_and_rules": {},
     }
@@ -747,7 +802,7 @@ Allowed tools:
 - robots_txt_analyser (args: {})
 - http_get (args: {"path":"/"} )  # choose from known/discovered paths only
 - content_type_check (args: {"paths":["/","/robots.txt","/ftp","/admin"]})
-- nmap_scan (args: {"target":"JUICE_TARGET","ports":"3000"})  # only at the very end, if needed
+- nmap_scan (args: {"target":"JUICE_TARGET","ports":"3000,4000,4001,4002"})  # only at the very end, if needed
 - capabilities_and_rules (args: {})
 
 If you are unsure, choose robots_txt_analyser first.
@@ -1040,21 +1095,6 @@ async def chat_completions(req: Request):
             "model": MODEL,
         })
 
-    if is_list_tools_question(last_user):
-        t = list_tools_table()
-        md = ["tool | purpose", "--- | ---"]
-        for r in t["table"]["rows"]:
-            md.append(f"{r['tool']} | {r['purpose']}")
-        return JSONResponse({
-            "id": "chatcmpl-agentic-demo",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "\n".join(md)},
-                "finish_reason": "stop",
-            }],
-            "model": MODEL,
-        })
 
 
     # 2) “List tools” question
@@ -1184,9 +1224,25 @@ async def chat_completions(req: Request):
             tool_text = tool_text[:MAX_TOOL_RESULT_CHARS] + "\n...<truncated>..."
         convo.append({"role": "user", "content": f"Tool result (truncated):\n{tool_text}"})
 
-    if final_text is None and observations:
-        if not is_tools_question(last_user):
-            final_text = summary_generator(observations)["summary"]
+
+
+
+    is_recon_request = "recon" in (last_user or "").lower()
+    if is_recon_request:
+        final_text = run_recon_pipeline()
+        return JSONResponse({
+            "id": "chatcmpl-agentic-demo",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text}, "finish_reason": "stop"}],
+            "model": MODEL,
+        })
+
+
+
+
+
+
+
 
     resp = {
         "id": "chatcmpl-agentic-demo",
