@@ -1,3 +1,10 @@
+#      Andrew Buchanan - Jan 2026
+#      Agentic demo stack launcher
+#      - Starts Juice Shop in Docker
+#      - Starts Ollama server (if not running)
+#      - Starts agent_api Uvicorn server
+#      - Starts Streamlit UI    
+
 #!/usr/bin/env python3
 import os
 import signal
